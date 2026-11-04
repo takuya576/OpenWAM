@@ -3,12 +3,17 @@
 Pure compute + IO — no GPU, no real Accelerator.
 """
 
+import sys
 import types
 
+import pytest
 import torch
+from omegaconf import OmegaConf
 
 from openwam.train.utils.training_utils import (
+    build_constant_scheduler,
     build_cosine_scheduler,
+    init_wandb,
     reduce_step_metrics,
     write_debug_loss_row,
 )
@@ -72,6 +77,56 @@ def test_cosine_scheduler_single_process_is_unscaled():
     assert warmup.total_iters == 100
     assert cosine.T_max == 900
     assert sched._milestones == [100]
+
+
+# --- build_constant_scheduler ---
+
+
+def test_constant_scheduler_warms_up_then_holds():
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1e-4)
+    sched = build_constant_scheduler(opt, total_opt_steps=1000, cfg=_cosine_cfg(warmup_ratio=0.1), num_processes=1)
+    lrs = []
+    for _ in range(1000):
+        lrs.append(opt.param_groups[0]["lr"])
+        opt.step()
+        sched.step()
+    assert lrs[0] == pytest.approx(1e-4 / 100)
+    assert lrs[50] < lrs[99] < 1e-4
+    assert lrs[100:] == pytest.approx([1e-4] * 900)
+
+
+def test_constant_scheduler_scales_warmup_by_num_processes():
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1e-4)
+    sched = build_constant_scheduler(opt, total_opt_steps=1000, cfg=_cosine_cfg(warmup_ratio=0.1), num_processes=8)
+    assert sched.total_iters == 100 * 8
+
+
+# --- init_wandb run naming ---
+
+
+def _init_wandb_name(monkeypatch, *, training_run_name=None, wandb_run_name=None):
+    calls = {}
+
+    def fake_init(**kwargs):
+        calls.update(kwargs)
+        return types.SimpleNamespace(name=kwargs["name"])
+
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(init=fake_init))
+    cfg = OmegaConf.create(
+        {
+            "training": {"run_name": training_run_name},
+            "project": {"wandb": {"project": "openwam", "run_name": wandb_run_name, "entity": None}},
+        }
+    )
+    init_wandb(cfg, "outputs/openwam_checkpoints/place_cube_right_n14/2026-10-27_23-10-00/")
+    return calls["name"]
+
+
+def test_init_wandb_names_run_after_its_checkpoint_dir(monkeypatch):
+    name = _init_wandb_name(monkeypatch, training_run_name="place_cube_right_n14")
+    assert name == "place_cube_right_n14_2026-10-27_23-10-00"
+    assert _init_wandb_name(monkeypatch) == "2026-10-27_23-10-00"
+    assert _init_wandb_name(monkeypatch, training_run_name="x", wandb_run_name="mine") == "mine"
 
 
 # --- write_debug_loss_row ---

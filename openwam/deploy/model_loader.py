@@ -223,12 +223,22 @@ def load_from_checkpoint_dir(
     _bd = OmegaConf.select(cfg, "dataloader.binary_action_dims", default=None)
     architecture.binary_command_dims = tuple(int(d) for d in (_bd or ()))
 
+    # 7b. Delta-action dims, likewise from the CKPT's dataloader config only. The engine adds the request
+    # state back to exactly the dims the checkpoint was trained relative to; were a deploy override able to
+    # drop them, relative offsets would reach the robot as absolute joint targets, and were it able to add
+    # them, the state would be added twice. JointInferenceEngine refuses a merged config that disagrees.
+    architecture.delta_action_dims = delta_action_dims_from_cfg(cfg)
+
     # 8. Representation contract advertised to eval clients (PolicyServer PONG). Bound HERE — to the
     # TRAINING cfg, before merge_deploy_cfg lets deploy overrides win — so a deploy yaml carrying
     # stray dataloader.* keys can never make the PONG advertise values the architecture isn't
     # actually using (normalizer stats selection, binary dims, torso masking all derive from the
     # training cfg at this point).
     architecture.repr_contract = repr_contract_from_cfg(cfg)
+
+    # 9. The weights file actually loaded, also advertised in the PONG: eval clients file their
+    # results under it, so they cannot disagree with what is being served.
+    architecture.ckpt_path = os.path.abspath(ckpt_path)
 
     logger.info("Model loaded successfully on %s", device)
     return cfg, architecture
@@ -253,6 +263,17 @@ def repr_contract_from_cfg(cfg: DictConfig) -> dict:
     if gripper_convention is not None:
         contract["gripper_convention"] = gripper_convention
     return contract
+
+
+def delta_action_dims_from_cfg(cfg: DictConfig) -> Tuple[int, ...]:
+    """Raw action dims a config trains relative to the chunk-start state (``dataloader.delta_action_dims``)."""
+    spec = OmegaConf.select(cfg, "dataloader.delta_action_dims", default=None)
+    if spec is None:
+        return ()
+    # Lazy: openwam.dataloader's package init pulls in every reader.
+    from openwam.dataloader.utils.unify_action import UNIFY_DIM, parse_dim_list
+
+    return parse_dim_list(spec, UNIFY_DIM)
 
 
 def _build_inner_normalizer(cfg: DictConfig, ckpt_dir: str):

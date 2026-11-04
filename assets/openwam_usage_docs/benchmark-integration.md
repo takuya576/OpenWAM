@@ -162,6 +162,8 @@ Reset clears buffered chunks and in-flight asynchronous inference; it does not r
 
 Synchronous and asynchronous execution use the same wire messages. The server may serve buffered action chunks without rerunning denoising on every step.
 
+A client that schedules execution itself can send the same observation with `"type": "chunk"` and receive the whole generated chunk, `{"type": "action_chunk", "actions": [[...], ...], "step": 1, "latency_ms": 190.0}`. This bypasses the executor, so it needs `inference_mode: sync`. Adding `"video": true` to the request also returns the imagined canvas frames as base64 PNGs in `"video"`, decoded for that request only. The real-robot YAM client, [scripts/run_yam_policy.py](../../scripts/run_yam_policy.py), uses both.
+
 ### Convert actions at the boundary
 
 Read the returned list in the exact order documented by the reader. Apply only benchmark-specific conversion, such as rot6d-to-quaternion or EEF-to-OSC delta; the server response is already in physical units. Preserve the training gripper sign and threshold. Existing NumPy converters are in [benchmarks/utils/action_conversion.py](../../benchmarks/utils/action_conversion.py).

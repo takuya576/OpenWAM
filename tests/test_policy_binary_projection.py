@@ -76,6 +76,22 @@ def test_projection_width_mismatch_raises():
         policy.predict_action({})
 
 
+def test_predict_chunk_returns_the_whole_projected_chunk_and_leaves_the_executor_alone():
+    policy = _policy(_FakeEngine([_chunk(3, 0.9), _chunk(4, -0.2)]), inference_horizon=2)
+    chunk, video = policy.predict_chunk({})
+    assert chunk.shape == (3, DIM) and np.all(chunk[:, MODE] == 1.0) and video is None
+    assert policy.predict_action({})[MODE] == -1.0  # the executor generated its own chunk, nothing buffered
+
+
+def test_predict_chunk_is_refused_in_async_mode():
+    policy = WAMPolicy(engine=_FakeEngine([]), cfg=SimpleNamespace(), execution_config={"mode": "async"})
+    try:
+        with pytest.raises(RuntimeError, match="inference_mode=sync"):
+            policy.predict_chunk({})
+    finally:
+        policy.shutdown()
+
+
 def test_projection_missing_architecture_is_noop():
     """Engines without an architecture (require_architecture=False paths) must not break."""
     engine = _FakeEngine([_chunk(2, -0.4)])

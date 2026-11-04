@@ -85,8 +85,36 @@ def build_cosine_scheduler(optimizer, *, total_opt_steps: int, cfg, num_processe
     return scheduler
 
 
-def init_wandb(cfg):
-    """Init a wandb run from cfg.project.wandb. Returns the run or None."""
+def build_constant_scheduler(optimizer, *, total_opt_steps: int, cfg, num_processes: int = 1):
+    """Linear-warmup, then constant LR.
+
+    Unlike a cosine run's mid-decay checkpoints, each checkpoint is then what a run
+    stopped at that step would have produced. Warmup is scaled by num_processes as in
+    build_cosine_scheduler.
+    """
+    from torch.optim.lr_scheduler import LinearLR
+
+    t = cfg.training
+    n = max(int(num_processes), 1)
+    warmup_steps = int(total_opt_steps * float(getattr(t, "warmup_ratio", 0.05)))
+    warmup_iters = warmup_steps * n
+    # LinearLR holds end_factor (1.0) once total_iters is reached.
+    scheduler = LinearLR(optimizer, start_factor=1.0 / max(warmup_iters, 1), total_iters=warmup_iters)
+    logger.info(
+        "LR scheduler: constant | total_opt_steps=%d warmup=%d lr=%.2e",
+        total_opt_steps,
+        warmup_steps,
+        float(t.learning_rate),
+    )
+    return scheduler
+
+
+def init_wandb(cfg, output_path: str | None = None):
+    """Init a wandb run from cfg.project.wandb. Returns the run or None.
+
+    An unset ``project.wandb.run_name`` names the run after its checkpoint dir,
+    ``<training.run_name>_<launch time>`` (e.g. place_cube_right_n14_2026-10-27_23-10-00).
+    """
     wandb_cfg = cfg.project.get("wandb", None)
     if wandb_cfg is None:
         return None
@@ -100,6 +128,9 @@ def init_wandb(cfg):
         return None
 
     run_name = getattr(wandb_cfg, "run_name", None)
+    if not run_name and output_path:
+        prefix = cfg_get(cfg_get(cfg, "training"), "run_name", None)
+        run_name = "_".join(filter(None, [prefix, os.path.basename(os.path.normpath(output_path))]))
     entity = getattr(wandb_cfg, "entity", None)
     from omegaconf import OmegaConf
 

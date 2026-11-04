@@ -319,3 +319,28 @@ def test_setup_output_dir_verifies_stats_before_reusing_resume_run(tmp_path, mon
     assert output_path == str(run_dir)
     assert resume_state_dir == str(state_dir)
     assert calls == [(str(run_dir), trainer.dataset)]
+
+
+def test_setup_output_dir_puts_each_launch_in_a_dated_dir_inside_run_name(tmp_path, monkeypatch):
+    import re
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from omegaconf import OmegaConf
+
+    import openwam.train.openwam_trainer as trainer_module
+
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda objects, src: None)
+    monkeypatch.setattr(trainer_module, "save_config", lambda path, cfg: Path(path, "config.yaml").write_text(""))
+    trainer = object.__new__(trainer_module.OpenWAMTrainer)
+    trainer.accelerator = SimpleNamespace(is_main_process=True)
+    trainer.architecture = SimpleNamespace(save_assets_for_deployment=lambda path, cfg: None)
+    trainer._ckpt_source_dir = None
+    trainer.dataset = None
+
+    for run_name, parent in (("place_cube_right_n56", tmp_path / "place_cube_right_n56"), (None, tmp_path)):
+        trainer.cfg = OmegaConf.create({"training": {"output_path": str(tmp_path), "run_name": run_name}})
+        output_path, resume_state_dir = trainer.setup_output_dir(debug=False, resume_path=None)
+        assert Path(output_path).parent == parent and resume_state_dir is None
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}", Path(output_path).name)
+        assert (Path(output_path) / "config.yaml").is_file()

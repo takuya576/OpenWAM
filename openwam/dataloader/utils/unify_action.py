@@ -180,6 +180,23 @@ def parse_unify_spec(spec: Sequence, unify_dim: int = UNIFY_DIM) -> np.ndarray:
     return dst_index
 
 
+def parse_dim_list(spec: Sequence, dim: int) -> Tuple[int, ...]:
+    """Parse a yaml list of dims in the unify spec syntax (``["0-5", "7-12"]``) into sorted indices.
+
+    Raises:
+        ValueError: on an empty list, a repeated dim, or a dim outside ``[0, dim)``.
+    """
+    dims = _expand_ranges(_coerce_spec(spec))
+    if not dims:
+        raise ValueError("dim list parsed to no dims")
+    if len(set(dims)) != len(dims):
+        raise ValueError(f"dim list repeats a dim: {dims}")
+    bad = [d for d in dims if not 0 <= d < dim]
+    if bad:
+        raise ValueError(f"dim(s) {bad} out of range [0, {dim})")
+    return tuple(sorted(dims))
+
+
 def map_to_unify(
     action: np.ndarray, dst_index: np.ndarray, unify_dim: int = UNIFY_DIM
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -228,4 +245,4 @@ def unmap_from_unify(unified: np.ndarray, dst_index: np.ndarray) -> np.ndarray:
     return unified[..., dst_index]  # gather along the last axis
 
 
-__all__ = ["UNIFY_DIM", "parse_unify_spec", "map_to_unify", "unmap_from_unify"]
+__all__ = ["UNIFY_DIM", "parse_unify_spec", "parse_dim_list", "map_to_unify", "unmap_from_unify"]

@@ -1,0 +1,10 @@
+# place_cube_right sweep, all 4 demos per position: episodes 0-55, yam.yaml's
+# own train split, so it reuses meta/yam_normalization_stats_train_0-56.npy.
+# See yam_place_cube_right_n14.yaml.
+defaults:
+  - yam
+  - _self_
+
+splits:
+  train: "0:56"
+  val: "56:66"

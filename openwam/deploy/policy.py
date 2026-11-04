@@ -12,6 +12,8 @@ The executor is chosen once at construction from the normalized async
 config; per-step dispatch is plain delegation.
 """
 
+from typing import Optional, Tuple
+
 import numpy as np
 
 from openwam.deploy.engine import BaseInferenceEngine
@@ -61,6 +63,31 @@ class WAMPolicy:
         downstream command contract for the WS server and direct consumers.
         """
         action = self._executor.predict_action(self._build_conditions(obs))
+        return self._project_binary_dims(action)
+
+    def predict_chunk(self, obs: dict, video: bool = False) -> Tuple[np.ndarray, Optional[list]]:
+        """Return one whole generated chunk ``(T, D)`` for the given (already preprocessed) observation.
+
+        Bypasses the executor: no buffering, no horizon, no state kept between
+        calls, so the client schedules execution itself. Refused in async mode,
+        where a background generation may be running on the same engine.
+        ``video=True`` also decodes the imagined frames (PIL images) for this
+        request; decoding runs after denoising, so the actions are unchanged.
+        """
+        if self._async:
+            raise RuntimeError(
+                "chunk requests need inference_mode=sync; the async executor may be generating on the same engine"
+            )
+        conditions = self._build_conditions(obs)
+        if video:
+            conditions["decode_video"] = True
+        result = self.engine.generate(conditions)
+        actions = result["actions"]
+        if hasattr(actions, "cpu"):
+            actions = actions.detach().cpu().numpy()
+        return self._project_binary_dims(np.asarray(actions)), (result.get("video") if video else None)
+
+    def _project_binary_dims(self, action: np.ndarray) -> np.ndarray:
         dims = getattr(getattr(self.engine, "architecture", None), "binary_command_dims", ()) or ()
         if dims:
             action = np.array(action)

@@ -1,6 +1,6 @@
 defaults:
   - model: dual_system            # [Optional]: dual_system(default), single_system, tri_system
-  - dataloader: robotwin          # [Optional]: robotwin(default), ebench, robocasa365, robocasa_gr1, robodojo, vlabench, libero
+  - dataloader: robotwin          # [Optional]: robotwin(default), ebench, robocasa365, robocasa_gr1, robodojo, vlabench, libero, yam
   - _self_
 
 training:
@@ -20,7 +20,8 @@ training:
   gradient_accumulation_steps: 1  # Accumulate N micro-batches before optimizer step
 
   # --- LR scheduler ---
-  lr_scheduler: cosine            # cosine with linear warmup; null = constant LR
+  lr_scheduler: cosine            # cosine with linear warmup; constant = linear warmup, then flat
+                                  # (every checkpoint = a run stopped there); null = constant LR, no warmup
   warmup_ratio: 0.05              # Fraction of total steps for linear warmup
   lr_min_ratio: 0.01              # Minimum LR as fraction of learning_rate
 
@@ -49,6 +50,8 @@ training:
 
   # --- Checkpoint ---
   output_path: outputs/openwam_checkpoints            # Base directory for checkpoint output (relative to the launch cwd)
+  run_name: null                  # Dir under output_path, e.g. place_cube_right_n56 (<task>_n<training episodes>), holding
+                                  # one timestamped dir per launch; null = timestamped dirs directly under output_path
   save_steps: 2000                # Save checkpoint every N steps (0 or null = disable saving)
   save_full_states_for_resume: false  # Also save resumable full state (optimizer/scheduler/RNG) at each save;
                                       # required for training.resume_ckpt_path, costs extra disk per checkpoint
@@ -67,5 +70,5 @@ project:
   seed: 42
   wandb:
     project: openwam
-    run_name: null
+    run_name: null                # null = <training.run_name>_<launch time>, as the checkpoint dir
     entity: null

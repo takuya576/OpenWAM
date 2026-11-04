@@ -44,6 +44,7 @@ from openwam.train.utils.checkpointing import (
 from openwam.train.utils.optimizer_groups import build_trainable_parameters
 from openwam.train.utils.seeding import per_step_seed, seed_process, wire_sampler_seed
 from openwam.train.utils.training_utils import (
+    build_constant_scheduler,
     build_cosine_scheduler,
     cfg_get,
     init_wandb,
@@ -251,7 +252,7 @@ class OpenWAMTrainer:
         all_params = [p for group in optimizer.param_groups for p in group["params"]]
 
         is_main = self.accelerator is None or self.accelerator.is_main_process
-        wandb_run = None if (debug or not is_main) else init_wandb(self.cfg)
+        wandb_run = None if (debug or not is_main) else init_wandb(self.cfg, output_path)
 
         from tqdm import tqdm
 
@@ -423,26 +424,31 @@ class OpenWAMTrainer:
             kwargs["worker_init_fn"] = dataloader_worker_init_fn
         return torch.utils.data.DataLoader(self.dataset, **kwargs)
 
-    # (5) Called by train() — linear-warmup + cosine schedule, or None (constant LR / debug).
+    # (5) Called by train() — linear warmup + cosine or constant, or None (constant LR / debug).
     def build_lr_scheduler(self, optimizer, total_opt_steps: int, debug: bool = False):
-        """Linear-warmup + cosine schedule, or None (constant LR / debug)."""
+        """Linear warmup + cosine or constant schedule, or None (constant LR / debug)."""
         t = self.cfg.training
         if debug:
             return None
-        if getattr(t, "lr_scheduler", None) == "cosine":
-            return build_cosine_scheduler(
-                optimizer, total_opt_steps=total_opt_steps, cfg=self.cfg, num_processes=self.accelerator.num_processes
-            )
-        return None
+        builders = {"cosine": build_cosine_scheduler, "constant": build_constant_scheduler}
+        name = getattr(t, "lr_scheduler", None)
+        if name is None:
+            return None
+        if name not in builders:
+            raise ValueError(f"training.lr_scheduler must be one of {sorted(builders)} or null, got {name!r}")
+        return builders[name](
+            optimizer, total_opt_steps=total_opt_steps, cfg=self.cfg, num_processes=self.accelerator.num_processes
+        )
 
     # (6) Called by train() — locate/create the run dir and resolve the resume state dir.
     def setup_output_dir(self, debug: bool, resume_path: str | None) -> tuple[str, str | None]:
         """Locate/create the run dir and resolve the resume state dir.
 
         With a usable resume state the run dir is REUSED (assets/config/norm already
-        present); otherwise rank-0 creates a fresh timestamped dir and broadcasts it.
-        All ranks resolve ``resume_state_dir`` independently (shared FS, deterministic),
-        so a missing-state error raises on every rank without deadlocking the broadcast.
+        present); otherwise rank-0 creates a fresh timestamped dir, inside
+        ``training.run_name`` when set, and broadcasts it. All ranks resolve
+        ``resume_state_dir`` independently (shared FS, deterministic), so a
+        missing-state error raises on every rank without deadlocking the broadcast.
         Returns ``(output_path, resume_state_dir)``.
         """
         base_output_path = getattr(self.cfg.training, "output_path", "./models")
@@ -470,7 +476,10 @@ class OpenWAMTrainer:
             run_dir_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             if debug:
                 run_dir_name += "_debug"
-            output_path = os.path.join(base_output_path, run_dir_name)
+            # Launches sharing a run_name (e.g. place_cube_right_n56) each get their own dated
+            # dir inside it, so a rerun cannot overwrite an earlier one's checkpoints.
+            run_name = getattr(self.cfg.training, "run_name", None) or ""
+            output_path = os.path.join(base_output_path, run_name, run_dir_name)
             os.makedirs(output_path, exist_ok=True)
             # Self-contained deploy: backbones save assets, then config + action stats.
             # BEFORE save_config so config.yaml carries the merged reconstruction specs.

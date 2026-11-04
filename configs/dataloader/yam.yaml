@@ -1,0 +1,72 @@
+type: yam
+
+# Bimanual I2RT YAM recording in LeRobot v2.1 layout. action (leader command)
+# and observation.state (follower position) are 14-D absolute joint positions:
+#   [left_joint_1..6, left_gripper, right_joint_1..6, right_gripper]
+# with grippers in i2rt's normalized aperture (0 = closed, 1 = open).
+dataset_dir: /data/takuya/OpenWAM/assets/datasets/place_cube_right
+
+# ── Episode split ────────────────────────────────────────────────────────────
+# Half-open episode_index ranges; overrides info.json's splits. Episodes 56-65
+# are held out for open-loop evaluation, so neither training nor the
+# normalization stats see them.
+splits:
+  train: "0:56"
+  val: "56:66"
+
+# ── Action space ─────────────────────────────────────────────────────────────
+# Joint space end to end: the policy emits joint targets, so execution needs
+# no IK. In the shared 80-D layout the grippers keep their α slots (9 left,
+# 43 right) and the twelve arm joints take the reserved slots 68:80 (left
+# 68-73, right 74-79); the EEF pose slots stay masked. Deploy reads
+# action_mode and this map from the checkpoint config to gather the 80-D
+# output back to the 14-D joint command.
+action_mode: joint
+unify_action: true
+unify_action_map: ["68-73", 9, "74-79", 43]
+unify_state_map: null  # null = state reuses unify_action_map
+
+# Delta actions (openpi's DeltaActions). The listed 14-D joint dims are trained
+# as action[t+k] - state[t], relative to the window's first state, and their
+# min-max stats are fitted on those relative chunks (a separate _delta<H> stats
+# file). The grippers must stay absolute. Proprio stays absolute. Deploy adds the
+# measured state back, so the server and open-loop eval still return absolute
+# joint targets. ["0-5", "7-12"] = every arm joint, openpi's make_bool_mask(6, -1, 6, -1);
+# null = absolute actions.
+delta_action_dims: null
+
+# ── Frame sampling ───────────────────────────────────────────────────────────
+# 33 raw frames at stride 4 produce 9 video frames and a 32-step action chunk.
+num_frames: 33
+video_stride: 4
+window_stride: 1
+split: train
+
+# ── Rendering (3-slot L-shape canvas) ────────────────────────────────────────
+# camera_layout = [head, left/bottom-left, right/bottom-right]; null slots are
+# rendered as black tiles. At 384x320: top 256Hx320W, bottom halves 128Hx160W.
+height: 384
+width: 320
+multiview: true
+camera_layout:
+  - observation.images.cam_high
+  - observation.images.cam_left_wrist
+  - observation.images.cam_right_wrist
+
+# ── Normalization ────────────────────────────────────────────────────────────
+# α fine-tuning fixes min-max, fitted on the train split only. Stats are
+# auto-built on first use into
+# <dataset_dir>/meta/yam_normalization_stats_train_<start>-<end>.npy (rank 0
+# computes, other ranks wait) with grippers pinned to [0, 1] and still joints
+# widened to a minimum span; see yam_stats_computation.py. A file that no
+# longer matches the train episodes is rejected; delete it to rebuild.
+normalize_mode: min-max
+
+# ── Video augmentation ───────────────────────────────────────────────────────
+# Same ColorJitter as the α bimanual real-robot fine-tunes; train split only.
+color_jitter:
+  enabled: true
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0

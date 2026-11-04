@@ -89,3 +89,9 @@ def test_main_forwards_readiness_token_to_server_builder(monkeypatch):
 
     assert built["readiness_token"] == "owner"
     assert built["run"] == ("0.0.0.0", 8848)
+
+
+def test_pong_names_the_served_weights_file():
+    architecture = SimpleNamespace(repr_contract={"representation": "joint"}, ckpt_path="/runs/n56/step_9.safetensors")
+    server = PolicyServer(engine=SimpleNamespace(architecture=architecture), cfg=OmegaConf.create({}))
+    assert server._pong_payload() == {"representation": "joint", "checkpoint": "/runs/n56/step_9.safetensors"}

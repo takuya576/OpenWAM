@@ -1,0 +1,22 @@
+# place_cube_right sample-efficiency sweep (n14 / n28 / n42 / n56), as in
+# lingbot-va's va_yam_place_cube_right_joint_cfg.py.
+#
+# Episodes 0-55 cover 14 cube positions x 4 demos, recorded in blocks:
+# episodes 4p..4p+3 share position p. Run nN trains on the first N/14 demos of
+# EVERY position, so each run sees all 14 positions and the subsets are nested
+# (n14 within n28 within n42 within n56); only demos per position vary.
+# Episodes 56-65 stay held out for open-loop evaluation.
+#
+# Everything else is yam.yaml's. The normalization stats are fitted on the
+# subset alone (auto-built as meta/yam_normalization_stats_train_<N>eps_<hash>.npy),
+# so a run never sees the action range of demos it is denied.
+#
+# Train every N with the same optimizer steps, batch and constant LR; see
+# scripts/train_place_cube_right_sweep.sh.
+defaults:
+  - yam
+  - _self_
+
+splits:
+  train: [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]  # 1 demo per position
+  val: "56:66"

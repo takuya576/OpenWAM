@@ -6,6 +6,12 @@ per-request conditions into ``architecture.generate(...)`` arguments, builds
 the denoise schedule, and owns server-lifetime caches (prompt embeddings,
 VACE context). The actual denoising loop lives on the model side
 (``BaseWAMArchitecture.generate``).
+
+A checkpoint trained with ``dataloader.delta_action_dims`` predicts those
+dims relative to the chunk-start state (openpi's ``DeltaActions``); the
+engine adds the raw request state back, so every caller receives absolute
+actions. The dims are bound to the checkpoint at load
+(``architecture.delta_action_dims``), not taken from deploy overrides.
 """
 
 import inspect
@@ -15,9 +21,11 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from openwam.deploy.denoise_schedule import make_schedule, normalize_denoise_config
+from openwam.deploy.model_loader import delta_action_dims_from_cfg
 from openwam.model.architectures.base import BaseWAMArchitecture
 
 logger = logging.getLogger(__name__)
@@ -117,6 +125,7 @@ class JointInferenceEngine(BaseInferenceEngine):
         self._architecture_generate_warned_dropped_kwargs: set[tuple[str, tuple[str, ...]]] = set()
         self._init_optimizations()
         self._init_cfg()
+        self._init_delta_actions()
 
     def _filter_architecture_generate_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Drop deploy-only kwargs the architecture's generate() cannot consume."""
@@ -248,6 +257,44 @@ class JointInferenceEngine(BaseInferenceEngine):
         if self._cfg_scale > 1.0:
             logger.info("CFG enabled: cfg_scale=%.3f cfg_merge=%s", self._cfg_scale, self._cfg_merge)
 
+    def _init_delta_actions(self):
+        """Take the delta-action dims bound to the checkpoint; refuse a deploy config that disagrees.
+
+        ``load_from_checkpoint_dir`` binds ``architecture.delta_action_dims`` from the training config,
+        before ``merge_deploy_cfg`` lets deploy overrides win, so the checkpoint alone decides which dims
+        get the state added back. ``self.cfg`` is the merged config: it may restate those dims, but a
+        value that drops, adds or changes them is an error rather than a silently different action space.
+        """
+        bound = tuple(getattr(self.architecture, "delta_action_dims", ()) or ())
+        configured = delta_action_dims_from_cfg(self.cfg)
+        if configured != bound:
+            raise ValueError(
+                f"deploy config sets dataloader.delta_action_dims to {list(configured)}, but the checkpoint "
+                f"predicts dims {list(bound)} relative to the robot state; delta dims are fixed by the "
+                "checkpoint, so remove the override"
+            )
+        self._delta_action_dims: tuple[int, ...] = bound
+        if bound:
+            logger.info("Delta actions: dims %s are returned with the request state added", bound)
+
+    def _absolute_actions(self, actions, state) -> np.ndarray:
+        """Add the raw chunk-start state to the delta dims (openpi's ``AbsoluteActions``)."""
+        if state is None:
+            raise ValueError(
+                f"this checkpoint predicts dims {list(self._delta_action_dims)} relative to the robot state; "
+                "the request must carry the raw state"
+            )
+        state = np.asarray(state, dtype=np.float32).reshape(-1)
+        actions = np.array(actions)
+        if actions.shape[-1] != state.shape[0] or max(self._delta_action_dims) >= state.shape[0]:
+            raise ValueError(
+                f"delta dims {list(self._delta_action_dims)} need raw-width actions and state, got actions "
+                f"{actions.shape} and state {state.shape}"
+            )
+        dims = list(self._delta_action_dims)
+        actions[..., dims] += state[dims]
+        return actions
+
     @torch.no_grad()
     def generate(self, conditions: dict) -> dict:
         """Generate video and/or actions from conditions.
@@ -276,6 +323,8 @@ class JointInferenceEngine(BaseInferenceEngine):
                 - variance_shift_alpha (float, optional): "async" only; lead curve shift
                 - linear_offset (float, optional): "async" only; lag start delay
                 - denoise_steps (int, optional): override num denoising steps
+                - decode_video (bool, optional): override ``optimization.decode_video``
+                  for this request
 
         Returns:
             dict with ``video`` (list of PIL images or None) and ``actions`` (numpy array).
@@ -326,6 +375,7 @@ class JointInferenceEngine(BaseInferenceEngine):
         if proprio is None:
             observation = conditions.get("observation") or {}
             proprio = observation.get("state") if isinstance(observation, dict) else None
+        raw_state = proprio
         if proprio is not None:
             proprio = self.architecture.normalize_deploy_proprio(proprio)
 
@@ -353,7 +403,7 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "num_inference_steps": denoise_steps,
                 "shift": shift,
                 "dit_cache": self._dit_cache,
-                "decode_video": self._decode_video,
+                "decode_video": conditions.get("decode_video", self._decode_video),
                 "profile": self._profile,
                 "vace_cache": self._vace_cache,
                 "prompt_embed_cache": self._prompt_embed_cache,
@@ -363,6 +413,8 @@ class JointInferenceEngine(BaseInferenceEngine):
             }
         )
         result = self.architecture.generate(**generate_kwargs)
+        if self._delta_action_dims:
+            result["actions"] = self._absolute_actions(result["actions"], raw_state)
 
         # Attach optimization stats if profiling
         if self._profile and self._dit_cache is not None:

@@ -32,6 +32,11 @@ Server-side behavior:
 
 Messages:
     obs   → {"type": "action", "action": [floats], "step": int, "latency_ms": float}
+    chunk → {"type": "action_chunk", "actions": [[floats], ...], "step": int, "latency_ms": float}
+            (same payload as obs; returns the whole generated chunk and bypasses the
+            executor, so the client schedules execution itself; sync inference_mode only.
+            With "video": true in the request the reply also carries "video": [base64 PNG
+            canvas per imagined frame], decoded for that request only.)
     reset → {"type": "reset_ack"}
     ping  → {"type": "pong"}
     error → {"type": "error", "code": str, "message": "<what went wrong>"}
@@ -58,10 +63,12 @@ logger = logging.getLogger(__name__)
 # these string values are a frozen wire contract and must never change.
 # Client -> server
 OBS = "obs"
+CHUNK = "chunk"
 RESET = "reset"
 PING = "ping"
 # Server -> client
 ACTION = "action"
+ACTION_CHUNK = "action_chunk"
 RESET_ACK = "reset_ack"
 PONG = "pong"
 ERROR = "error"
@@ -73,6 +80,16 @@ ERR_INTERNAL = "internal_error"
 # Cap for a single obs message. A multi-camera base64 frame can exceed the
 # 1 MB websockets default, so lift it for the obs stream.
 MAX_MESSAGE_BYTES = 32 * 1024 * 1024
+
+
+def _png_b64(image) -> str:
+    """Base64 PNG of a PIL image. Level 1: a 384x320 canvas encodes in a few ms."""
+    import base64
+    import io
+
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG", compress_level=1)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def _infer_video_num_frames(dl) -> int:
@@ -179,9 +196,12 @@ class PolicyServer:
         return dict(contract) if contract else {}
 
     def _pong_payload(self) -> dict:
-        """Return checkpoint compatibility plus optional launch ownership."""
+        """Return checkpoint compatibility, the served weights file, plus optional launch ownership."""
 
         result = self._ckpt_contract()
+        ckpt_path = getattr(getattr(self.engine, "architecture", None), "ckpt_path", None)
+        if ckpt_path:
+            result["checkpoint"] = ckpt_path
         if self.readiness_token is not None:
             result["readiness_token"] = self.readiness_token
         return result
@@ -216,6 +236,31 @@ class PolicyServer:
             "step": self._request_count,
             "latency_ms": round(latency_ms, 2),
         }
+
+    def predict_chunk(self, obs: dict) -> dict:
+        """Generate one whole action chunk for a single observation.
+
+        Same observation contract as :meth:`predict`, plus an optional
+        ``"video": true``. Returns a dict with "actions" (``T`` lists of floats
+        in physical units), "step" and "latency_ms", and with ``video`` also
+        "video": the imagined canvas frames as base64 PNGs, frame 0 being the
+        VAE reconstruction of the input.
+        """
+        self._init_policy()
+        t0 = time.monotonic()
+
+        want_video = bool(obs.get("video"))
+        obs = self._obs_preprocessor.preprocess(obs)
+        actions, video = self._policy.predict_chunk(obs, video=want_video)
+        reply = {"actions": actions.tolist()}
+        if want_video:
+            reply["video"] = [_png_b64(frame) for frame in video or []]
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        self._request_count += 1
+        self._total_latency += latency_ms
+
+        return {**reply, "step": self._request_count, "latency_ms": round(latency_ms, 2)}
 
     def reset(self):
         """Reset policy state."""
@@ -258,6 +303,10 @@ class PolicyServer:
                         elif msg_type == OBS:
                             result = self.predict(data)
                             result["type"] = ACTION
+                            await websocket.send(json.dumps(result))
+                        elif msg_type == CHUNK:
+                            result = self.predict_chunk(data)
+                            result["type"] = ACTION_CHUNK
                             await websocket.send(json.dumps(result))
                         elif msg_type == PING:
                             await websocket.send(json.dumps({"type": PONG, **self._pong_payload()}))
