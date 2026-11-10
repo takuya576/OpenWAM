@@ -752,6 +752,23 @@ class WanBase(VideoBackbone):
     # ABC: Unified preprocessing (1)
     # ================================================================
 
+    def enable_train_text_cache(self, *, offload_encoder: bool = False, max_entries: int = 4096) -> None:
+        """Serve training prompts from a :class:`~wan.encode.PromptEmbeddingCache`.
+
+        ``offload_encoder`` marks the frozen text encoder for CPU residency; the
+        trainer applies it with :meth:`apply_text_encoder_offload` after its last
+        device move. Deploy never calls this (it has its own prompt cache).
+        """
+        self._train_text_cache = wan_encode.PromptEmbeddingCache(max_entries=max_entries)
+        self._text_encoder_offload = bool(offload_encoder)
+
+    def apply_text_encoder_offload(self) -> None:
+        """Move the text encoder to CPU when :meth:`enable_train_text_cache` asked for it."""
+        if getattr(self, "_text_encoder_offload", False) and getattr(self, "text_encoder", None) is not None:
+            self.text_encoder.to(device="cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
         """Unified train preprocessing: raw data (``frames``/``text``, optional
         ``vace_videos``/``ref_images`` in kw) → the denoising-loop input dict.
@@ -770,9 +787,15 @@ class WanBase(VideoBackbone):
         )
 
         batch_size = len(frames)
-        context, seq_lens = wan_encode.encode_text(
-            text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
-        )
+        text_cache = getattr(self, "_train_text_cache", None)
+        if text_cache is not None:
+            context, seq_lens = text_cache.encode(
+                text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+            )
+        else:
+            context, seq_lens = wan_encode.encode_text(
+                text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+            )
 
         all_input_videos = []
         for clip_frames in frames:

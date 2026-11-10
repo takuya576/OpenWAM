@@ -30,9 +30,13 @@ client stops first, with the arms holding, and leaves a record of why:
 
 One rollout per invocation: disconnecting is what makes ``rd serve`` stop and home
 the arms, and it exits afterwards. Startup homes the arms, warms up the policy
-server, then waits for Enter while you stage the scene. Ctrl-C once stops
-dispatching at the next step with the arms holding; twice exits at once. Either
-way these are written to --out, by default
+server, then waits for Enter while you stage the scene. Ctrl-C once lets the
+chunk being dispatched run to its end -- every command already generated, and
+with --video the live canvases its imagined frames stand for -- then stops with
+the arms holding; a chunk still being generated is never dispatched, and is kept
+in rollout.npz but left out of the video. A safeguard halt still stops at once,
+and so does a second Ctrl-C.
+Either way these are written to --out, by default
 outputs/eval_out/<run>/<checkpoint>/closed_loop/ for the checkpoint the policy
 server reports, beside scripts/open_loop_eval.py's open_loop/ for it. After a real
 rollout you are asked for a success / fail / exclude label:
@@ -410,7 +414,11 @@ def check_start_state(q: np.ndarray) -> List[str]:
 
 
 class Stopper:
-    """Ctrl-C once to stop dispatching at the next step, with the arms holding; twice to exit at once."""
+    """Ctrl-C once to stop after the chunk being dispatched, with the arms holding; twice to exit at once.
+
+    The dispatch loop does not look at ``stop``: a chunk once started runs out, so
+    every imagined frame of it gets the live canvas it stands for.
+    """
 
     def __init__(self):
         self.stop = False
@@ -421,7 +429,11 @@ class Stopper:
             print("\n[stop] second interrupt -- exiting now", flush=True)
             raise KeyboardInterrupt
         self.stop = True
-        print("\n[stop] stopping at the next step; the arms hold their last command", flush=True)
+        print(
+            "\n[stop] finishing the commands already generated, then stopping with the arms holding "
+            "(Ctrl-C again to exit at once)",
+            flush=True,
+        )
 
 
 @contextlib.contextmanager
@@ -682,17 +694,20 @@ def run_rollout(robot, policy: PolicyConnection, args, stopper: Stopper, record:
             cmds, clip, slew = shape_chunk(actions, state, last_cmd, hold, args, record)
 
             if args.step and sys.stdin.isatty():
-                input(f"[step] chunk {chunk_i}: {len(cmds)} steps ready. Enter to execute: ")
-                if stopper.stop:
-                    break
+                input(f"[step] chunk {chunk_i}: {len(cmds)} steps ready. Enter to execute (Ctrl-C, Enter to stop): ")
+            # The last point at which Ctrl-C keeps a chunk from moving the arms: once its first
+            # command is sent, it runs out (barring a safeguard halt).
+            if stopper.stop:
+                if clip_video is not None:
+                    record["video"].pop()  # no live frames to pair it with; rollout.npz keeps the chunk
+                print(f"[stop] chunk {chunk_i} not dispatched", flush=True)
+                break
             # Arms stand still from the end of one chunk's dispatch to the start of the next.
             hold_ms = roundtrip_ms if t_dispatch_end is None else (time.perf_counter() - t_dispatch_end) * 1e3
             timing["hold"].append(hold_ms)
 
             max_track, deadline = 0.0, time.perf_counter()
             for i, cmd in enumerate(cmds):
-                if stopper.stop:
-                    break
                 if not args.dry_run:
                     robot.put_action(cmd.astype(np.float32))
                 history.append(cmd)
@@ -728,7 +743,8 @@ def run_rollout(robot, policy: PolicyConnection, args, stopper: Stopper, record:
                     )
             t_dispatch_end = time.perf_counter()
             # The delayed canvases of the chunk's last frames, while the arms close in on its last command.
-            if clip_video is not None and not stopper.stop:
+            # Taken after a Ctrl-C too: they are what pairs the chunk's last imagined frames with the scene.
+            if clip_video is not None:
                 for step in range(len(cmds) + 1, len(cmds) + clip_video["delay"] + 1):
                     deadline += period
                     time.sleep(max(0.0, deadline - time.perf_counter()))

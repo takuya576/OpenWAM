@@ -10,7 +10,7 @@ defaults:
   - yam
   - _self_
 
-dataset_dir: /data/takuya/OpenWAM/assets/datasets/stand_up_bottle
+dataset_dir: /data2/takuya/OpenWAM/assets/datasets/stand_up_bottle
 
 splits:
   train: "0:50"

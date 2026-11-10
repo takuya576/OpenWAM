@@ -4,7 +4,7 @@ type: yam
 # and observation.state (follower position) are 14-D absolute joint positions:
 #   [left_joint_1..6, left_gripper, right_joint_1..6, right_gripper]
 # with grippers in i2rt's normalized aperture (0 = closed, 1 = open).
-dataset_dir: /data/takuya/OpenWAM/assets/datasets/place_cube_right
+dataset_dir: /data2/takuya/OpenWAM/assets/datasets/place_cube_right
 
 # ── Episode split ────────────────────────────────────────────────────────────
 # Half-open episode_index ranges; overrides info.json's splits. Episodes 56-65

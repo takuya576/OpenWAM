@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import signal
 import socket
 import sys
@@ -366,6 +367,56 @@ def test_video_frames_hold_the_last_live_canvas_past_the_executed_steps():
     # a horizon on the frame grid ends on a captured frame, which is the one held
     frames, _ = ryp.video_frames({"video": [{**clip, "live": [gray, gray, blue]}]})
     assert all(live_px(frame) == (0, 0, 250) for frame in frames[2:])
+
+
+class InterruptedRobot(FakeRobot):
+    """The operator presses Ctrl-C right after the ``at``-th command is sent."""
+
+    def __init__(self, at, **kwargs):
+        super().__init__(**kwargs)
+        self.at = at
+
+    def put_action(self, action):
+        super().put_action(action)
+        if len(self.sent) == self.at:
+            signal.raise_signal(signal.SIGINT)
+
+
+def test_ctrl_c_mid_chunk_runs_it_out_with_every_live_frame(run, engine):
+    engine.chunk_fn = _ramp(0.01)
+    robot = InterruptedRobot(at=10)
+    code, summary, _ = run(robot, "--video", "--max-chunks", "3")
+    assert code == 0 and summary["halt_reason"] is None
+    # the interrupted chunk is dispatched to its last command, and no further one is requested
+    assert len(robot.sent) == CHUNK_LEN and (summary["chunks"], summary["steps"]) == (1, CHUNK_LEN)
+    assert len(engine.calls) == 2  # warmup + that chunk
+    # every imagined frame, the last one's delayed canvas included, has its live counterpart
+    assert summary["video_psnr_db"] == {str(j): 100.0 for j in range(9)}
+
+
+def test_ctrl_c_while_a_chunk_is_generated_keeps_it_from_moving_the_arms(run, engine, monkeypatch):
+    clips, video_frames = [], ryp.video_frames
+
+    def spy(record):
+        clips.extend(record["video"])
+        return video_frames(record)
+
+    monkeypatch.setattr(ryp, "video_frames", spy)
+    ramp = _ramp(0.01)
+
+    def fn(state):
+        if len(engine.calls) == 3:  # warmup, chunk 0, and now chunk 1
+            os.kill(os.getpid(), signal.SIGINT)
+        return ramp(state)
+
+    engine.chunk_fn = fn
+    robot = FakeRobot()
+    code, summary, npz = run(robot, "--video", "--max-chunks", "3")
+    assert code == 0 and summary["halt_reason"] is None
+    assert len(robot.sent) == CHUNK_LEN and (summary["chunks"], summary["steps"]) == (2, CHUNK_LEN)
+    assert npz["predicted"].shape == (2, CHUNK_LEN, 14)  # recorded, though never dispatched
+    # but left out of the video, which holds only the executed chunk, every frame paired
+    assert [clip["start"] for clip in clips] == [0] and len(clips[0]["live"]) == 9
 
 
 def test_settle_observes_the_arms_where_the_next_chunk_starts(run, engine):

@@ -232,6 +232,30 @@ training:
 
 Set `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, and `MASTER_ADDR` for multi-node launch.
 
+### LoRA fine-tuning on 46 GB GPUs
+
+Fine-tuning OpenWAM-α in full trains ~6B parameters and needs 80 GB GPUs under ZeRO-2. `training.lora` trains low-rank adapters on the `nn.Linear` layers of the video DiT instead, while the action expert, the proprio encoder and the DiT's head and patch embedding (plus its biases, norms and AdaLN modulation) still train in full. With the prompt-embedding cache and the frozen text encoder kept on CPU, a 4-GPU run at 8 samples per GPU peaks at about 28 GB per GPU (L40S).
+
+~~~yaml
+training:
+  text_embedding_cache: true      # memoize prompt embeddings; skips the per-step umT5 forward
+  text_encoder_offload: true      # keep the frozen text encoder on CPU (requires the cache)
+  lora:
+    enabled: true
+    rank: 128
+    alpha: 128                    # update scaling = alpha / rank
+    lr: 5e-4                      # adapter LR; every full-train parameter keeps learning_rate
+    targets: [video_backbone.dit]  # nn.Linear layers under these modules get adapters
+    full_train: [action_backbone, proprio_encoder, video_backbone.dit.head, video_backbone.dit.patch_embedding]
+    train_bias_and_norm: true
+~~~
+
+Checkpoints are written merged: each adapter is folded into its base weight (fp32 math, one rounding to bf16) and the adapter keys are dropped, so a LoRA checkpoint has the key set of a full fine-tune and deploys, evaluates and warm-starts (`finetune_ckpt_path`) unchanged. `resume_ckpt_path` restores the unmerged adapters from the saved Accelerate state. The YAM launchers take `LORA=1`, which keeps the global batch at 256 (`32 / NPROC_PER_NODE` per GPU × 8 accumulation) on 4 GPUs by default:
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 LORA=1 DELTA=1 bash scripts/train_place_cube_right_sweep.sh 56
+~~~
+
 ## 3. Deploy a checkpoint
 
 Deployment defaults are defined in [configs/deploy.yaml](../../configs/deploy.yaml). A training output contains weights, `config.yaml`, normalization data, tokenizer/component assets, and the saved model specification. Start a WebSocket server with:

@@ -21,17 +21,39 @@
 # the first optimizer step. WAIT_FOR_GPUS=1 blocks until no other compute
 # process is on the GPUs (two checks a minute apart), then launches.
 #
-# Checkpoints: outputs/openwam_checkpoints/stand_up_bottle_n50[_delta]/<launch time>/
-# wandb run:   stand_up_bottle_n50[_delta]_<launch time>
+# LORA=1 fine-tunes with LoRA instead of in full (training.lora in configs/train.yaml;
+# see scripts/train_place_cube_right_sweep.sh): it fits 46 GB GPUs (L40S), defaults to 4
+# of them with 32 / NPROC_PER_NODE per GPU (global batch still 256, same step counts),
+# adapter LR LORA_LR (default 5e-4). Run names get a _lora suffix.
+#
+# Checkpoints: outputs/openwam_checkpoints/stand_up_bottle_n50[_delta][_lora]/<launch time>/
+# wandb run:   stand_up_bottle_n50[_delta][_lora]_<launch time>
 #
 # Usage:
 #   bash scripts/train_stand_up_bottle.sh
 #   WAIT_FOR_GPUS=1 bash scripts/train_stand_up_bottle.sh
 #   bash scripts/train_stand_up_bottle.sh training.debug=true   # args go to Hydra
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 LORA=1 bash scripts/train_stand_up_bottle.sh
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+batch_size=16
+lora_args=()
+if [[ "${LORA:-0}" == "1" ]]; then
+    export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+    if (( 32 % NPROC_PER_NODE != 0 )); then
+        echo "LORA=1: NPROC_PER_NODE=${NPROC_PER_NODE} must divide 32 (global batch 256 = per-GPU x GPUs x 8)" >&2
+        exit 1
+    fi
+    batch_size=$(( 32 / NPROC_PER_NODE ))
+    lora_args=(
+        training.lora.enabled=true
+        "training.lora.lr=${LORA_LR:-5e-4}"
+        training.text_embedding_cache=true
+        training.text_encoder_offload=true
+    )
+fi
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 FOUNDATION="${FOUNDATION:-$PWD/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Pretrain-Foundation-Model}"
 
@@ -41,6 +63,7 @@ if [[ "${DELTA:-1}" == "1" ]]; then
     run_name+="_delta"
     delta_args=('dataloader.delta_action_dims=["0-5","7-12"]')
 fi
+if [[ "${LORA:-0}" == "1" ]]; then run_name+="_lora"; fi
 
 if [[ "${WAIT_FOR_GPUS:-0}" == "1" ]]; then
     echo "[$(date '+%F %T')] waiting until no other compute process is on the GPUs..."
@@ -63,11 +86,12 @@ bash scripts/train.sh \
     training.run_name="${run_name}" \
     training.num_epochs=null \
     training.max_steps=8192 \
-    training.batch_size=16 \
+    training.batch_size="${batch_size}" \
     training.gradient_accumulation_steps=8 \
     training.learning_rate=1e-4 \
     training.lr_scheduler=constant \
     training.warmup_ratio=0.05 \
     training.save_steps=2048 \
     training.keep_last_k_ckpts=4 \
+    ${lora_args[@]+"${lora_args[@]}"} \
     "$@"

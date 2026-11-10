@@ -151,6 +151,37 @@ class OpenWAMTrainer:
         for name in self.architecture.freeze_modules(freeze_list):
             logger.info("Frozen: %s", name)
 
+        is_main = self.accelerator is None or self.accelerator.is_main_process
+
+        # --- LoRA (training.lora.enabled): low-rank adapters on the target
+        # nn.Linear layers, the full_train modules trained in full, everything
+        # else frozen. After the freeze list (whose no_grad-wrapped modules it
+        # refuses to train) and before prepare(), so the optimizer, DeepSpeed
+        # and a resumed accelerate state all see the adapted module tree.
+        from openwam.model.lora import LoRAConfig, apply_lora
+
+        self._lora_cfg = LoRAConfig.from_training_cfg(t)
+        if self._lora_cfg is not None:
+            report = apply_lora(self.architecture, self._lora_cfg, frozen=freeze_list)
+            logger.info(report.summary())
+            if is_main:
+                print(report.summary(), flush=True)
+
+        # --- Text-encoder cost: memoize per-prompt embeddings (the encoder is
+        # frozen, so a prompt's embedding never changes) and optionally keep the
+        # encoder on CPU. Offloading needs the cache, or every step would run it there.
+        self._text_cache = bool(t.get("text_embedding_cache", False))
+        self._text_encoder_offload = bool(t.get("text_encoder_offload", False))
+        if self._text_encoder_offload and not self._text_cache:
+            raise ValueError("training.text_encoder_offload=true requires training.text_embedding_cache=true.")
+        if self._text_cache:
+            vb = self.architecture.video_backbone
+            if not hasattr(vb, "enable_train_text_cache"):
+                raise ValueError(
+                    f"training.text_embedding_cache is not supported by video backbone {type(vb).__name__}."
+                )
+            vb.enable_train_text_cache(offload_encoder=self._text_encoder_offload)
+
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
 
@@ -169,7 +200,6 @@ class OpenWAMTrainer:
 
         self.model = self  # self-reference some external callers expect
 
-        is_main = self.accelerator is None or self.accelerator.is_main_process
         log_parameter_counts(self.architecture, is_main=is_main)
 
     # (2) Driver — build optimizer/dataloader/scheduler -> setup dir -> accelerate prepare
@@ -383,6 +413,7 @@ class OpenWAMTrainer:
             self,
             action_lr=float(t.action_lr) if getattr(t, "action_lr", None) else None,
             video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
+            lora_lr=getattr(getattr(self, "_lora_cfg", None), "lr", None),
         )
         betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
         return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
@@ -527,6 +558,11 @@ class OpenWAMTrainer:
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
         arch.set_dtype_device(arch.dtype, self.accelerator.device)
         arch.move_frozen_to_device(self.accelerator.device)
+        if getattr(self, "_text_encoder_offload", False):
+            # Last device move of the run, so the encoder stays on CPU from here on;
+            # cached prompts never touch it again and misses are encoded there.
+            arch.video_backbone.apply_text_encoder_offload()
+            logger.info("Text encoder offloaded to CPU (text_embedding_cache serves the training prompts).")
         logger.info(
             "architecture wrapped (%s), device=%s",
             type(self.architecture).__name__,

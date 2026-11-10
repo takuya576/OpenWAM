@@ -7,7 +7,10 @@ selects the external-encoder path; otherwise the native Wan VAE is used.
 
 from __future__ import annotations
 
-from typing import Tuple
+import contextlib
+import os
+from collections import OrderedDict
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -32,6 +35,88 @@ def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tens
     for i, v in enumerate(seq_lens):
         context[i, v:] = 0
     return context, seq_lens
+
+
+def _module_device(module, fallback) -> torch.device:
+    param = next(iter(module.parameters()), None) if hasattr(module, "parameters") else None
+    return param.device if param is not None else torch.device(fallback)
+
+
+@contextlib.contextmanager
+def _cpu_encode_threads(device: torch.device):
+    """Widen torch's intra-op pool for a CPU encode.
+
+    torchrun pins every rank to ``OMP_NUM_THREADS=1``; a single-threaded
+    umT5-XXL forward would take minutes. Each rank borrows its share of the
+    cores for the (rare) cache miss and then restores the pool.
+    """
+    if device.type != "cpu":
+        yield
+        return
+    previous = torch.get_num_threads()
+    share = (os.cpu_count() or 1) // max(int(os.environ.get("LOCAL_WORLD_SIZE", "1")), 1)
+    torch.set_num_threads(max(previous, min(32, share)))
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+class PromptEmbeddingCache:
+    """Training-side memo of per-prompt text-encoder embeddings.
+
+    The text encoder is frozen, so a prompt's embedding never changes, and a
+    fine-tuning set typically has a handful of prompts. Serving them from this
+    cache removes the per-step encoder forward (umT5-XXL over 512 padded tokens
+    — about a quarter of a Wan2.2-5B training step) and lets the encoder live
+    on CPU (``text_encoder_offload``), where only cache misses run.
+
+    Each entry keeps just the valid tokens; :meth:`encode` rebuilds exactly the
+    zero-padded ``(context, seq_lens)`` pair :func:`encode_text` returns.
+    Entries are evicted least-recently-used beyond ``max_entries``.
+    """
+
+    def __init__(self, max_entries: int = 4096):
+        self.max_entries = int(max_entries)
+        self._store: "OrderedDict[str, Tensor]" = OrderedDict()
+        self._padded_len: Optional[int] = None
+        self.hits = 0
+        self.misses = 0
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+    def __contains__(self, prompt: str) -> bool:
+        return prompt in self._store
+
+    @torch.no_grad()
+    def encode(self, prompts: Sequence[str], *, tokenizer, text_encoder, device) -> Tuple[Tensor, Tensor]:
+        device = torch.device(device)
+        missing = [p for p in dict.fromkeys(prompts) if p not in self._store]
+        if missing:
+            # Encode where the encoder lives (CPU when offloaded), store on `device`.
+            enc_device = _module_device(text_encoder, device)
+            with _cpu_encode_threads(enc_device):
+                context, seq_lens = encode_text(missing, tokenizer=tokenizer, text_encoder=text_encoder, device=enc_device)
+            self._padded_len = int(context.shape[1])
+            for prompt, emb, n in zip(missing, context, seq_lens.tolist()):
+                self._store[prompt] = emb[: int(n)].to(device=device).clone()
+        n_missed = sum(1 for p in prompts if p in missing)
+        self.misses += n_missed
+        self.hits += len(prompts) - n_missed
+
+        entries = [self._store[p] for p in prompts]
+        out = torch.zeros(
+            (len(prompts), self._padded_len, entries[0].shape[-1]), dtype=entries[0].dtype, device=device
+        )
+        for i, (prompt, emb) in enumerate(zip(prompts, entries)):
+            out[i, : emb.shape[0]] = emb
+            self._store.move_to_end(prompt)
+        seq_lens = torch.tensor([emb.shape[0] for emb in entries], dtype=torch.long, device=device)
+        # Evict only after assembling, so a batch wider than max_entries still resolves.
+        while len(self._store) > self.max_entries:
+            self._store.popitem(last=False)
+        return out, seq_lens
 
 
 def encode_text_for_inference(

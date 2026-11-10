@@ -1,0 +1,17 @@
+# hang_ring: "Hang the ring on the lower right peg." 54 YAM episodes (0-53) at
+# 30 fps; as in place_cube_right only the right arm moves.
+#
+# Episodes 0-49 train the model and fit the normalization stats (auto-built as
+# meta/yam_normalization_stats_train_0-50[_delta32].npy); episodes 50-53 are
+# held out for open-loop evaluation. Everything else is yam.yaml's. Delta arm
+# actions are opted into at launch (dataloader.delta_action_dims=["0-5","7-12"]),
+# as in the place_cube_right *_delta runs.
+defaults:
+  - yam
+  - _self_
+
+dataset_dir: /data2/takuya/OpenWAM/assets/datasets/hang_ring
+
+splits:
+  train: "0:50"
+  val: "50:54"

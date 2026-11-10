@@ -39,6 +39,25 @@ training:
   use_gradient_checkpointing_offload: false  # Offload checkpointed activations to CPU
   initialize_model_on_cpu: false         # Load model on CPU, let DeepSpeed move to GPU
   offload_optimizer_device: none         # DeepSpeed ZeRO optimizer-state offload: none / cpu
+  text_embedding_cache: false            # Memoize per-prompt text embeddings (frozen encoder => same values); skips
+                                         # the per-step umT5 forward (~1/4 of a Wan2.2-5B step). Wan backbones only
+  text_encoder_offload: false            # Keep the frozen text encoder on CPU (needs text_embedding_cache; only
+                                         # cache misses run there): frees ~11 GB/GPU for Wan2.2-5B
+
+  # --- LoRA (parameter-efficient fine-tuning; see openwam/model/lora.py) ---
+  # Adapters W + (alpha/rank)·B·A on every nn.Linear under `targets` (pretrained W frozen), the `full_train`
+  # modules trained in full, everything else frozen. Checkpoints are saved MERGED (adapters folded into W,
+  # adapter keys dropped), so they deploy / warm-start exactly like a full fine-tune's.
+  lora:
+    enabled: false
+    rank: 128
+    alpha: 128                    # scaling = alpha / rank
+    dropout: 0.0
+    lr: null                      # LR of the adapter params (null = learning_rate); full_train params keep learning_rate
+    targets: [video_backbone.dit]  # module prefixes whose nn.Linear layers get adapters
+    exclude: []                   # globs on dotted layer names that never get an adapter
+    full_train: [action_backbone, proprio_encoder, video_backbone.dit.head, video_backbone.dit.patch_embedding]
+    train_bias_and_norm: true     # also train biases, norm weights and AdaLN modulation inside `targets` (~3M params)
 
   # --- Loss weights ---
   lambda_video: 1.0               # Video flow-matching loss weight

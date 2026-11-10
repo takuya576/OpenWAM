@@ -201,8 +201,16 @@ def save_weights(accelerator, architecture, output_path: str, global_step: int, 
     otherwise every rank can clone the full state dict to host memory at once
     and exhaust the node during checkpointing. Pruning is the caller's job, run
     after the full state is also written so the two lines stay in lockstep.
+
+    LoRA runs (``training.lora``) are written MERGED: every adapter is folded
+    into its base weight (fp32 math, one rounding to bf16) and the adapter keys
+    are dropped, so the file has exactly the key set of a full fine-tune and
+    deploys / warm-starts unchanged. ``get_state_dict`` returns CPU copies under
+    ZeRO-1/2, so merging never touches the live (still-training) weights.
     """
     from tqdm import tqdm
+
+    from openwam.model.lora import lora_scalings, merge_lora_state_dict
 
     if not accelerator.is_main_process:
         return
@@ -211,7 +219,14 @@ def save_weights(accelerator, architecture, output_path: str, global_step: int, 
     logger.info(msg)
     tqdm.write(msg)
     state_dict = accelerator.get_state_dict(architecture)
-    accelerator.unwrap_model(architecture).save_checkpoint(ckpt_path, state_dict=state_dict)
+    model = accelerator.unwrap_model(architecture)
+    scalings = lora_scalings(model)
+    if scalings:
+        state_dict = merge_lora_state_dict(state_dict, scalings, compute_device=accelerator.device)
+        msg = f"[checkpoint] merged {len(scalings)} LoRA adapters into their base weights"
+        logger.info(msg)
+        tqdm.write(msg)
+    model.save_checkpoint(ckpt_path, state_dict=state_dict)
     msg = f"[checkpoint] Saved{' final' if final else ''}: {ckpt_path}"
     logger.info(msg)
     tqdm.write(msg)

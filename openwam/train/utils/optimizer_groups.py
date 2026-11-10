@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-def build_trainable_parameters(model, *, action_lr=None, video_lr=None):
+def build_trainable_parameters(model, *, action_lr=None, video_lr=None, lora_lr=None):
     """Bucket every trainable top-level param by owner, then build optimizer groups:
 
     - ``video_backbone`` → optional ``video_lr``
@@ -11,6 +11,9 @@ def build_trainable_parameters(model, *, action_lr=None, video_lr=None):
     - every other trainable top-level module (tri_system's ``vlm_backbone`` /
       ``understanding_expert`` / …) → the optimizer base ``learning_rate``, never a
       per-group override.
+    - with ``lora_lr`` set, the LoRA adapters (``lora_A`` / ``lora_B``, see
+      ``openwam.model.lora``) form their own group at that LR wherever they live;
+      without it they ride their owner's bucket like any other param.
 
     Source of truth: ``BaseWAMArchitecture.get_trainable_modules()`` (top-level
     children that hold at least one ``requires_grad`` param). Only ``requires_grad``
@@ -19,7 +22,9 @@ def build_trainable_parameters(model, *, action_lr=None, video_lr=None):
     reach the optimizer. With no per-group LR override, returns a flat param list;
     otherwise returns groups.
     """
-    action_params, video_params, other_params = [], [], []
+    from openwam.model.lora import is_lora_param_name
+
+    action_params, video_params, other_params, lora_params = [], [], [], []
     for mod_name, mod in model.architecture.get_trainable_modules().items():
         if mod_name == "video_backbone":
             bucket = video_params
@@ -27,14 +32,17 @@ def build_trainable_parameters(model, *, action_lr=None, video_lr=None):
             bucket = action_params
         else:
             bucket = other_params
-        bucket.extend(param for param in mod.parameters() if param.requires_grad)
+        for name, param in mod.named_parameters():
+            if not param.requires_grad:
+                continue
+            (lora_params if lora_lr is not None and is_lora_param_name(name) else bucket).append(param)
 
-    if action_lr is None and video_lr is None:
+    if action_lr is None and video_lr is None and lora_lr is None:
         return action_params + video_params + other_params
 
     # action / video may carry their own LR; "other" always rides the base LR (lr=None).
     groups = []
-    for params, lr in [(action_params, action_lr), (video_params, video_lr), (other_params, None)]:
+    for params, lr in [(action_params, action_lr), (video_params, video_lr), (other_params, None), (lora_params, lora_lr)]:
         if not params:
             continue
         group = {"params": params}
