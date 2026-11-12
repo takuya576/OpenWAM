@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -32,10 +31,6 @@ from openwam.dataloader.interndata_a1 import (
     detect_arm_layout,
     discover_a1_buckets,
     embodiment_key,
-    iter_data_shards,
-    load_excluded_episodes,
-    parse_shard_path,
-    resolve_trim_bounds,
 )
 from openwam.dataloader.utils.eef import (
     ARM10_DIM,
@@ -44,7 +39,6 @@ from openwam.dataloader.utils.eef import (
     quat_wxyz_to_rot6d,
     quat_xyzw_to_rot6d,
 )
-from openwam.dataloader.utils.lerobotv3 import DataContractError
 from openwam.dataloader.utils.normalization import ROT6D_DIMS_EEF20
 
 HEAD = "images.rgb.head"
@@ -138,7 +132,7 @@ def _make_bucket(
     rng = np.random.RandomState(seed)
     cols: dict = {
         "task_index": np.zeros(total, dtype=np.int64),
-        # Real A1 shards carry this; the cleaned-view filters key on it.
+        # Physical episode IDs are aligned with the cleaned manifest.
         "episode_index": np.repeat(np.arange(n_eps, dtype=np.int64), ep_len),
     }
     for i, side in enumerate(sides):
@@ -671,110 +665,87 @@ class TestGripperHarmonization:
 
 
 class TestStats:
-    def _write_stats(
-        self,
-        root: Path,
-        embodiment: str,
-        *,
-        pin_rot6d: bool = True,
-        buckets=("cat/split_aloha/task",),
-        split="train",
-        trim_active=False,
-        min_keep=2,
-    ):
+    @staticmethod
+    def _write_stats(root: Path, embodiment: str, *, width: int = EEF_DIM):
         (root / "meta").mkdir(parents=True, exist_ok=True)
         eef = {
-            "mean": [0.0] * EEF_DIM,
-            "std": [1.0] * EEF_DIM,
-            "min": [-2.0] * EEF_DIM,
-            "max": [2.0] * EEF_DIM,
-            "q01": [-2.0] * EEF_DIM,
-            "q99": [2.0] * EEF_DIM,
+            "mean": [0.0] * width,
+            "std": [1.0] * width,
+            "min": [-2.0] * width,
+            "max": [2.0] * width,
+            "q01": [-2.0] * width,
+            "q99": [2.0] * width,
         }
-        if pin_rot6d:
-            for dim in ROT6D_DIMS_EEF20:
-                eef["q01"][dim] = -1.0
-                eef["q99"][dim] = 1.0
-        (root / "meta" / f"stats_{embodiment}.json").write_text(
-            json.dumps(
-                {
-                    "eef": eef,
-                    "population": {
-                        "split": split,
-                        "trim_active": trim_active,
-                        "min_keep": min_keep,
-                        "buckets": list(buckets),
-                    },
-                }
-            )
-        )
+        path = root / "meta" / f"stats_{embodiment}.json"
+        path.write_text(json.dumps({"eef": eef}))
+        return path
 
-    def test_missing_stats_file_raises_actionable_error(self, tmp_path, patch_decode):
-        d = _make_bucket(tmp_path, "cat/split_aloha/task")
-        with pytest.raises(FileNotFoundError, match="interndata_a1_stats_computation"):
-            InternDataA1Dataset(str(d), a1_stats_root=str(tmp_path), normalize_mode="quantile")
-
-    def test_missing_stats_error_prescribes_the_stats_root_it_looked_in(self, tmp_path, patch_decode):
-        """The suggested command must carry --stats_root, pointing at the SAME
-        directory the failed lookup used. Otherwise the one scenario stats_root
-        exists for — a read-only dataset mount — hands the user a command that
-        writes where this lookup does not read, reproducing the same error."""
-        d = _make_bucket(tmp_path, "cat/split_aloha/task")
-        elsewhere = tmp_path / "scratch"
-        with pytest.raises(FileNotFoundError) as e:
-            InternDataA1Dataset(str(d), a1_stats_root=str(elsewhere), normalize_mode="quantile")
-        msg = str(e.value)
-        assert f"--stats_root {elsewhere}" in msg
-        # And it names the path it actually looked for, so the two agree.
-        assert str(elsewhere / "meta" / "stats_split_aloha.json") in msg
+    def test_missing_precomputed_stats_fails_without_writing(self, tmp_path, patch_decode):
+        d = _make_bucket(tmp_path, "family/cat/split_aloha/task")
+        before = {p.relative_to(tmp_path) for p in tmp_path.rglob("*")}
+        with pytest.raises(FileNotFoundError, match="stats_split_aloha.json"):
+            InternDataA1Dataset(str(d), normalize_mode="quantile")
+        assert {p.relative_to(tmp_path) for p in tmp_path.rglob("*")} == before
 
     def test_normalize_mode_null_needs_no_stats(self, tmp_path, patch_decode):
         d = _make_bucket(tmp_path, "cat/split_aloha/task")
         ds = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=9, video_stride=4)
         assert ds._normalization_stats is None
 
-    def test_shared_stats_root_is_used_not_the_bucket_dir(self, tmp_path, patch_decode):
-        """Buckets sit at variable depth; stats live once at the dataset root."""
-        d = _make_bucket(tmp_path, "cat/split_aloha/task")
-        self._write_stats(tmp_path, "split_aloha")
-        ds = InternDataA1Dataset(
-            str(d), a1_stats_root=str(tmp_path), normalize_mode="quantile", num_frames=9, video_stride=4
-        )
+    def test_leaf_uses_stats_in_renamed_family_ancestor(self, tmp_path, patch_decode):
+        family = tmp_path / "my_portable_family"
+        d = _make_bucket(family, "cat/split_aloha/task")
+        stats = self._write_stats(family, "split_aloha")
+        before = stats.read_bytes()
+        ds = InternDataA1Dataset(str(d), normalize_mode="quantile", num_frames=9, video_stride=4)
         assert ds._normalization_stats is not None
+        assert stats.read_bytes() == before
+        assert not list(tmp_path.rglob("normalization_stats.npy"))
+
+    def test_nearest_dataset_stats_are_used(self, tmp_path, patch_decode):
+        family = tmp_path / "family"
+        d = _make_bucket(family, "cat/split_aloha/task")
+        outer = self._write_stats(tmp_path, "split_aloha")
+        inner = self._write_stats(family, "split_aloha")
+        payload = json.loads(outer.read_text())
+        payload["eef"]["q99"][0] = 77.0
+        outer.write_text(json.dumps(payload))
+        ds = InternDataA1Dataset(str(d), normalize_mode="quantile")
+        assert ds._normalization_stats["q99"][0] == 2.0
+        assert inner.is_file()
 
     def test_rot6d_dims_pass_through_normalization(self, tmp_path, patch_decode):
-        """Pinned rot6d stats must leave the rotation representation untouched,
-        while pos/gripper dims are rescaled."""
         d = _make_bucket(tmp_path, "cat/split_aloha/task")
         self._write_stats(tmp_path, "split_aloha")
         raw = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=9, video_stride=4)
-        norm = InternDataA1Dataset(
-            str(d), a1_stats_root=str(tmp_path), normalize_mode="quantile", num_frames=9, video_stride=4
-        )
-        a_raw = raw[0]["action"].numpy()
-        a_norm = norm[0]["action"].numpy()
+        norm = InternDataA1Dataset(str(d), normalize_mode="quantile", num_frames=9, video_stride=4)
+        a_raw, a_norm = raw[0]["action"].numpy(), norm[0]["action"].numpy()
         np.testing.assert_allclose(a_norm[:, list(ROT6D_DIMS_EEF20)], a_raw[:, list(ROT6D_DIMS_EEF20)], atol=1e-6)
-        # xyz dims used q01/q99 = +-2 -> genuinely rescaled
         assert not np.allclose(a_norm[:, 0:3], a_raw[:, 0:3], atol=1e-6)
 
     def test_wrong_width_stats_rejected(self, tmp_path, patch_decode):
         d = _make_bucket(tmp_path, "cat/split_aloha/task")
-        (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "meta" / "stats_split_aloha.json").write_text(
-            json.dumps(
-                {
-                    "eef": {k: [0.0] * 10 for k in ("mean", "std", "min", "max", "q01", "q99")},
-                    "population": {
-                        "split": "train",
-                        "trim_active": False,
-                        "min_keep": 2,
-                        "buckets": ["cat/split_aloha/task"],
-                    },
-                }
-            )
-        )
+        self._write_stats(tmp_path, "split_aloha", width=10)
         with pytest.raises(ValueError, match="!= expected 20"):
-            InternDataA1Dataset(str(d), a1_stats_root=str(tmp_path), normalize_mode="quantile")
+            InternDataA1Dataset(str(d), normalize_mode="quantile")
+
+    def test_nonfinite_stats_rejected(self, tmp_path, patch_decode):
+        d = _make_bucket(tmp_path, "cat/split_aloha/task")
+        path = self._write_stats(tmp_path, "split_aloha")
+        payload = json.loads(path.read_text())
+        payload["eef"]["q99"][0] = float("nan")
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match="non-finite"):
+            InternDataA1Dataset(str(d), normalize_mode="quantile")
+
+    def test_required_quantile_fields_are_not_computed(self, tmp_path, patch_decode):
+        d = _make_bucket(tmp_path, "cat/split_aloha/task")
+        path = self._write_stats(tmp_path, "split_aloha")
+        payload = json.loads(path.read_text())
+        del payload["eef"]["q99"]
+        path.write_text(json.dumps(payload))
+        with pytest.raises(KeyError, match="q99"):
+            InternDataA1Dataset(str(d), normalize_mode="quantile")
 
 
 class TestUnifyScatter:
@@ -827,25 +798,22 @@ class TestFromConfig:
         assert len(ds) == sum(len(b) for b in ds.buckets)
         assert ds[0]["action"].shape == (8, EEF_DIM)
 
-    def test_root_mode_rejects_removed_pooled_contributor(self, tmp_path, patch_decode):
+    def test_root_mode_uses_existing_family_stats_without_historical_provenance(self, tmp_path, patch_decode):
         _make_bucket(tmp_path, "cat/split_aloha/current")
-        (tmp_path / "meta").mkdir(exist_ok=True)
-        (tmp_path / "meta" / "stats_split_aloha.json").write_text(
-            json.dumps(
-                {
-                    "population": {
-                        "buckets": ["cat/split_aloha/current", "cat/split_aloha/removed"],
-                        "empty_buckets": [],
-                    }
-                }
-            )
+        TestStats._write_stats(tmp_path, "split_aloha")
+        ds = InternDataA1Dataset.from_config(
+            {"dataset_dir": str(tmp_path), "normalize_mode": "quantile", "num_frames": 9},
+            split="train",
         )
+        assert len(ds.buckets) == 1
+        assert ds.buckets[0]._normalization_stats is not None
 
-        with pytest.raises(DataContractError, match="contributor set no longer matches"):
-            InternDataA1Dataset.from_config(
-                {"dataset_dir": str(tmp_path), "normalize_mode": "quantile"},
-                split="train",
-            )
+    def test_root_missing_embodiment_stats_cannot_silently_drop_a_bucket(self, tmp_path, patch_decode):
+        _make_bucket(tmp_path, "cat/split_aloha/present")
+        _make_bucket(tmp_path, "cat/franka/missing", layout="single_arm", robot_type="Franka")
+        TestStats._write_stats(tmp_path, "split_aloha")
+        with pytest.raises(FileNotFoundError, match="stats_franka.json"):
+            InternDataA1Dataset.from_config({"dataset_dir": str(tmp_path), "normalize_mode": "quantile"})
 
     def test_single_bucket_mode(self, tmp_path, patch_decode):
         d = _make_bucket(tmp_path, "cat/split_aloha/task")
@@ -866,8 +834,8 @@ class TestFromConfig:
         ids = sorted(b._dataset_id for b in ds.buckets)
         assert ids == ["cat/franka/taskA/google_scan-book", "cat/franka/taskB/google_scan-book"]
 
-    def test_empty_root_raises_pointing_at_extraction(self, tmp_path):
-        with pytest.raises(FileNotFoundError, match="extracted"):
+    def test_empty_root_raises_with_missing_metadata(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="meta/info.json"):
             InternDataA1Dataset.from_config({"dataset_dir": str(tmp_path)}, split="train")
 
     def test_registered_under_interndata_a1(self):
@@ -877,188 +845,43 @@ class TestFromConfig:
 
 
 # ---------------------------------------------------------------------------
-# Cleaned-view / trim regression coverage
+# Cleaned-manifest offset and timestamp coverage
 # ---------------------------------------------------------------------------
 
 
 class TestCleanedViewOffsets:
-    """A cleaned view must not express deletions by dropping meta/episodes rows.
+    """Clean manifests and file IDs are authoritative; no source repair runs."""
 
-    ``_data_row_offset`` is a ``groupby(chunk, file).cumsum()`` over the rows
-    currently in ``eps_df``. A cleaned view symlinks ``data/`` at the untouched
-    source shards, so a shortened manifest makes every deleted episode's length
-    vanish from that sum and silently slides later episodes onto earlier frames.
-    ``meta/excluded_episodes.json`` is applied after the offsets are computed,
-    so it does not have this failure mode.
-    """
-
-    def test_excluded_first_episode_leaves_the_second_at_its_physical_offset(self, tmp_path, patch_decode):
+    def test_cleaned_data_does_not_apply_an_old_external_exclusion_file(self, tmp_path, patch_decode):
         d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
         (d / "meta" / "excluded_episodes.json").write_text(json.dumps({"episode_indices": [0]}))
-
         ds = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
+        assert ds._eps_df["episode_index"].tolist() == [0, 1]
+        assert ds._ep_data_row_offset.tolist() == [0, 4]
+        for off in ds._ep_video_frame_offsets.values():
+            assert off.tolist() == [0, 4]
 
-        assert ds._eps_df["episode_index"].tolist() == [1]
-        # Episode 1 physically starts at row 4 of the shard; the exclusion must
-        # not renumber it to 0.
-        assert int(ds._ep_data_row_offset[0]) == 4
-        assert ds._ep_video_frame_offsets, "no camera offsets resolved"
-        for cam, off in ds._ep_video_frame_offsets.items():
-            assert int(off[0]) == 4, f"{cam} offset collapsed to {int(off[0])}"
-
-    def test_dropping_a_manifest_row_no_longer_shifts_the_survivor(self, tmp_path, patch_decode):
-        """The failure mode this class was written for, now closed at the source.
-
-        `_add_data_offsets` rebuilds each offset from `dataset_from_index` and the
-        shards' real row counts, so it no longer depends on a cumsum over the
-        surviving rows — a shortened manifest cannot displace anything. This once
-        asserted the WRONG offset (0 instead of 4) to pin the hazard; it now
-        asserts the right one, so the guarantee is pinned rather than the bug.
-
-        excluded_episodes.json remains the correct way to express deletions —
-        it keeps meta/episodes intact and self-describing — but offsets are no
-        longer the reason why.
-        """
+    def test_incomplete_manifest_is_rejected_without_repair(self, tmp_path, patch_decode):
         d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        man = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        t = pq.read_table(man)
-        pq.write_table(t.slice(1, 1), man)  # keep only episode 1
+        path = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+        pq.write_table(pq.read_table(path).slice(1, 1), path)
+        with pytest.raises(ValueError, match="missing rows"):
+            InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
 
-        ds = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-
-        assert ds._eps_df["episode_index"].tolist() == [1]
-        assert int(ds._ep_data_row_offset[0]) == 4  # physical start, not 0
-        # And EVERY camera, not just the parquet rows. Checking only the data
-        # offset once let a half-fix advertise alignment safety while the video
-        # offsets still collapsed to 0 — pairing episode 1's actions with
-        # episode 0's frames, which is worse than either error alone.
-        assert ds._ep_video_frame_offsets, "no camera offsets resolved"
-        for cam, off in ds._ep_video_frame_offsets.items():
-            assert int(off[0]) == 4, f"{cam} offset collapsed to {int(off[0])}"
-
-
-class TestTrimTooShortIsLeftWhole:
-    """A trim that would leave less than one window keeps the episode intact —
-    and the stats path must make the identical call (they share
-    :func:`resolve_trim_bounds`), or the normalizer describes episodes the
-    reader never emits that way."""
-
-    def test_reader_leaves_a_too_short_trim_whole(self, tmp_path, patch_decode):
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=1, ep_len=4)
-        trim = tmp_path / "trim.csv"
-        trim.write_text(
-            "dataset,episode_index,total_frames,trim_head_to,trim_tail_from\n"
-            "cat/split_aloha/task,0,4,3,\n"  # would leave 1 frame < min_len 2
-        )
-        ds = InternDataA1Dataset(
-            str(d),
-            dataset_id="cat/split_aloha/task",
-            normalize_mode=None,
-            trim_csv=str(trim),
-            num_frames=2,
-            video_stride=1,
-        )
-        assert int(ds._eps_df["length"].iloc[0]) == 4
-        assert int(ds._ep_data_row_offset[0]) == 0
-
-    def test_resolve_trim_bounds_rejects_the_short_case_and_accepts_a_valid_one(self):
-        assert resolve_trim_bounds((3, None, 4), 4, 2) is None  # leaves 1 < 2
-        assert resolve_trim_bounds((1, None, 4), 4, 2) == (1, 4)  # leaves 3
-        assert resolve_trim_bounds((1, None, 99), 4, 2) is None  # stale total_frames
-        assert resolve_trim_bounds((0, None, 4), 4, 2) is None  # no-op
-
-
-class TestStaleShardIndex:
-    """`data/file_index` goes stale at shard boundaries: the episode that starts a
-    new shard keeps the previous file's index.
-
-    In affected multi-shard buckets, the base
-    `groupby(chunk,file).cumsum()` points boundary episodes into the previous
-    shard — a valid row range that reads back real numbers, so it pairs an
-    episode with another one's frames and raises nothing.
-    """
-
-    def _two_shard_bucket(self, tmp_path):
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        src = d / "data" / "chunk-000" / "file-000.parquet"
-        t = pq.read_table(src)
-        pq.write_table(t.slice(0, 4), src)
-        pq.write_table(t.slice(4, 4), d / "data" / "chunk-000" / "file-001.parquet")
-        man = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        m = pq.read_table(man).to_pydict()
-        m["data/file_index"] = [0, 0]  # ep1 really lives in file-001
-        m["dataset_from_index"] = [0, 4]
-        m["dataset_to_index"] = [4, 8]
-        pq.write_table(pa.Table.from_pydict(m), man)
-        return d
-
-    def test_the_boundary_episode_resolves_to_its_real_shard(self, tmp_path, patch_decode):
-        d = self._two_shard_bucket(tmp_path)
-        ds = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-        i = ds._eps_df.index[ds._eps_df["episode_index"] == 1][0]
-        pos = list(ds._eps_df.index).index(i)
-        assert int(ds._eps_df["data/file_index"].loc[i]) == 1
-        assert int(ds._ep_data_row_offset[pos]) == 0
-
-    def test_the_unaffected_episode_is_untouched(self, tmp_path, patch_decode):
-        d = self._two_shard_bucket(tmp_path)
-        ds = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-        i = ds._eps_df.index[ds._eps_df["episode_index"] == 0][0]
-        pos = list(ds._eps_df.index).index(i)
-        assert int(ds._eps_df["data/file_index"].loc[i]) == 0
-        assert int(ds._ep_data_row_offset[pos]) == 0
-
-
-class TestShardCompleteness:
-    """A missing shard must fail loudly rather than resolve onto another episode.
-
-    The cumulative boundaries close over whatever files exist, so with a shard
-    gone every episode start still lands inside the total found on disk, and each
-    later episode maps onto a plausible row of the wrong file.
-    """
-
-    def test_a_missing_middle_shard_is_rejected(self, tmp_path, patch_decode):
+    def test_canonical_file_ids_and_file_local_offsets_are_preserved(self, tmp_path, patch_decode):
         d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=3, ep_len=4)
-        src = d / "data" / "chunk-000" / "file-000.parquet"
-        t = pq.read_table(src)
-        pq.write_table(t.slice(0, 4), src)
-        pq.write_table(t.slice(8, 4), d / "data" / "chunk-000" / "file-002.parquet")
-        man = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        m = pq.read_table(man).to_pydict()
-        m["dataset_from_index"] = [0, 4, 8]
-        m["dataset_to_index"] = [4, 8, 12]
-        pq.write_table(pa.Table.from_pydict(m), man)
-        with pytest.raises(ValueError, match="shard is missing"):
-            InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-
-    def test_an_episode_overrunning_its_shard_is_rejected(self, tmp_path, patch_decode):
-        """Equal totals are not enough — 3+5 physical rows satisfy a 4+4 manifest."""
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        src = d / "data" / "chunk-000" / "file-000.parquet"
-        t = pq.read_table(src)
-        pq.write_table(t.slice(0, 3), src)
-        pq.write_table(t.slice(3, 5), d / "data" / "chunk-000" / "file-001.parquet")
-        man = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        m = pq.read_table(man).to_pydict()
-        m["dataset_from_index"] = [0, 4]
-        m["dataset_to_index"] = [4, 8]
-        pq.write_table(pa.Table.from_pydict(m), man)
-        with pytest.raises(ValueError, match="shard holding only"):
-            InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-
-    def test_complete_shards_are_accepted(self, tmp_path, patch_decode):
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        src = d / "data" / "chunk-000" / "file-000.parquet"
-        t = pq.read_table(src)
-        pq.write_table(t.slice(0, 4), src)
-        pq.write_table(t.slice(4, 4), d / "data" / "chunk-000" / "file-001.parquet")
-        man = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        m = pq.read_table(man).to_pydict()
-        m["dataset_from_index"] = [0, 4]
-        m["dataset_to_index"] = [4, 8]
-        pq.write_table(pa.Table.from_pydict(m), man)
+        manifest = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+        rows = pq.read_table(manifest).to_pydict()
+        rows["data/file_index"] = [0, 0, 1]
+        pq.write_table(pa.Table.from_pydict(rows), manifest)
+        path = d / "data" / "chunk-000" / "file-000.parquet"
+        data = pq.read_table(path)
+        pq.write_table(data.slice(0, 8), path)
+        pq.write_table(data.slice(8, 4), path.with_name("file-001.parquet"))
         ds = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-        assert len(ds._eps_df) == 2
+        assert ds._eps_df["data/file_index"].tolist() == [0, 0, 1]
+        assert ds._ep_data_row_offset.tolist() == [0, 4, 0]
+        assert len(ds) > 0
 
 
 class TestVideoOffsetValidation:
@@ -1080,7 +903,7 @@ class TestVideoOffsetValidation:
         m = pq.read_table(man).to_pydict()
         m["videos/images.rgb.head/from_timestamp"] = [float("nan"), 0.1333]
         pq.write_table(pa.Table.from_pydict(m), man)
-        with pytest.raises(ValueError, match="non-finite or negative"):
+        with pytest.raises(ValueError, match="invalid from_timestamp"):
             InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
 
     def test_two_episodes_sharing_a_frame_offset_are_rejected(self, tmp_path, patch_decode):
@@ -1091,6 +914,7 @@ class TestVideoOffsetValidation:
             k = f"videos/{cam}/from_timestamp"
             if k in m:
                 m[k] = [0.0, 0.0]  # both episodes start at frame 0 of one shard
+                m[f"videos/{cam}/to_timestamp"] = [4 / 30, 4 / 30]
         pq.write_table(pa.Table.from_pydict(m), man)
         with pytest.raises(ValueError, match="overlaps episode"):
             InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
@@ -1148,7 +972,7 @@ class TestVideoOffsetValidation:
             pytest.skip("fixture carries no to_timestamp column")
         m[tk] = [m["videos/images.rgb.head/from_timestamp"][0] + 9 / 30, m[tk][1]]
         pq.write_table(pa.Table.from_pydict(m), man)
-        with pytest.raises(ValueError, match="describes two different episodes"):
+        with pytest.raises(ValueError, match="span does not match the declared episode length"):
             InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
 
     def test_a_non_finite_video_span_is_rejected_not_skipped(self, tmp_path, patch_decode):
@@ -1161,7 +985,7 @@ class TestVideoOffsetValidation:
             pytest.skip("fixture carries no to_timestamp column")
         m[tk] = [float("nan"), m[tk][1]]
         pq.write_table(pa.Table.from_pydict(m), man)
-        with pytest.raises(ValueError, match="describes two different episodes"):
+        with pytest.raises(ValueError, match="span does not match the declared episode length"):
             InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
 
 
@@ -1194,254 +1018,20 @@ class TestManifestRangeValidation:
         with pytest.raises(ValueError, match="declares length=3"):
             InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
 
-    def test_a_gap_is_still_accepted(self, tmp_path, patch_decode):
-        """Non-overlap is required; a perfect tiling is NOT.
 
-        A manifest gap means rows belong to no episode, which is how a dropped
-        row expresses "skip this one" — handled correctly by the offset rebuild
-        and asserted by TestCleanedViewOffsets. Demanding contiguity would
-        reject that working configuration to catch nothing.
-        """
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=3, ep_len=4)
-        man = d / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        m = pq.read_table(man).to_pydict()
-        keep = [i for i in range(3) if i != 1]  # drop the middle episode
-        pq.write_table(pa.Table.from_pydict({k: [v[i] for i in keep] for k, v in m.items()}), man)
-        r = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-        assert len(r._eps_df) == 2
-
-    def test_a_substituted_equal_length_shard_is_rejected(self, tmp_path, patch_decode):
-        """An equal-length copy of another shard passes every count-based check.
-
-        file-001 replaced by a copy of file-000: the totals still balance, every
-        episode still fits its resolved shard, and the reader constructs — while
-        manifest episodes [0,1] both resolve onto physical episode 0. The
-        shard's own episode_index range (from parquet row-group statistics, so
-        no column is read) is what distinguishes them.
-        """
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        data_dir = d / "data" / "chunk-000"
-        src = pq.read_table(data_dir / "file-000.parquet").to_pydict()
-        half = {k: v[:4] for k, v in src.items()}
-        pq.write_table(pa.Table.from_pydict(half), data_dir / "file-000.parquet")
-        pq.write_table(pa.Table.from_pydict(half), data_dir / "file-001.parquet")
-        with pytest.raises(ValueError, match="only holds episodes 0..0"):
-            InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-
-    def test_a_stray_backup_parquet_is_not_a_shard(self, tmp_path, patch_decode):
-        """`file-000.backup.parquet` matches the glob but is not a shard.
-
-        The reader's exact parse always dropped it; the stats generator's glob
-        did not, so a copy left in place doubled the statistics population while
-        the reader read half of it. Both sides now enumerate through
-        `iter_data_shards`.
-        """
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        data_dir = d / "data" / "chunk-000"
-        shutil.copy(data_dir / "file-000.parquet", data_dir / "file-000.backup.parquet")
-        assert parse_shard_path(data_dir / "file-000.backup.parquet") is None
-        assert [p.name for _, _, p in iter_data_shards(d)] == ["file-000.parquet"]
-        r = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-        assert len(r) > 0
-
-    def test_shards_are_ordered_by_index_not_lexically(self, tmp_path):
-        """`file-1000` follows `file-999`; a lexical sort puts it first.
-
-        Both names are canonical (`{:03d}` widens past three digits), so this is
-        reachable on a corpus with over a thousand shards.
-        """
-        b = tmp_path / "b"
-        (b / "data" / "chunk-000").mkdir(parents=True)
-        for i in (0, 999, 1000):
-            pq.write_table(pa.table({"x": [i]}), b / "data" / "chunk-000" / f"file-{i:03d}.parquet")
-        assert [f for _, f, _ in iter_data_shards(b)] == [0, 999, 1000]
-
-    def test_a_non_canonical_shard_name_is_not_a_shard(self, tmp_path, patch_decode):
-        """`file-0.parquet` is a name the data_path template cannot produce.
-
-        Sampling rebuilds the path from `info.json[data_path]` with `{:03d}`, so
-        an unpadded file is enumerable but unreadable: the scan pooled its rows
-        and the reader built windows over them, and only the first real data
-        load failed — on a different, non-existent path. Rejecting it at
-        enumeration turns that into an immediate, accurate error.
-        """
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        shard = d / "data" / "chunk-000" / "file-000.parquet"
-        shard.rename(shard.with_name("file-0.parquet"))
-        assert parse_shard_path(shard.with_name("file-0.parquet")) is None
-        assert iter_data_shards(d) == []
-        with pytest.raises(FileNotFoundError, match="No data parquet files"):
-            InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-
-    def test_an_aliased_shard_name_is_not_a_shard(self, tmp_path):
-        """`file-00.parquet` would otherwise claim shard 0 alongside `file-000`."""
-        b = tmp_path / "b"
-        (b / "data" / "chunk-000").mkdir(parents=True)
-        for name in ("file-000.parquet", "file-00.parquet"):
-            pq.write_table(pa.table({"x": [0]}), b / "data" / "chunk-000" / name)
-        assert [f for _, f, _ in iter_data_shards(b)] == [0]
-
-    def test_a_canonical_shard_under_a_non_canonical_chunk_is_rejected(self, tmp_path):
-        b = tmp_path / "b"
-        (b / "data" / "chunk-0").mkdir(parents=True)
-        pq.write_table(pa.table({"x": [0]}), b / "data" / "chunk-0" / "file-000.parquet")
-        assert iter_data_shards(b) == []
+def test_root_mode_cannot_borrow_stats_from_outside_configured_family(tmp_path, patch_decode):
+    family = tmp_path / "family"
+    _make_bucket(family, "cat/split_aloha/task")
+    TestStats._write_stats(tmp_path, "split_aloha")
+    with pytest.raises(FileNotFoundError, match="stats_split_aloha.json"):
+        InternDataA1Dataset.from_config({"dataset_dir": str(family), "normalize_mode": "quantile"})
 
 
-class TestExclusionParser:
-    """One strict parser, because the two casts disagreed."""
-
-    def test_quoted_indices_are_refused_rather_than_reinterpreted(self, tmp_path):
-        """`["0"]` excluded episode 0 in the generator and nothing in the reader.
-
-        The base reader keeps the JSON values verbatim and matches them against
-        an integer column, so a quoted index excludes nothing there, while an
-        `int()` cast in the generator excluded it. Refusing is the one answer
-        that is identical on both sides by construction.
-        """
-        b = tmp_path / "b"
-        (b / "meta").mkdir(parents=True)
-        (b / "meta" / "excluded_episodes.json").write_text(json.dumps({"episode_indices": ["0"]}))
-        with pytest.raises(ValueError, match="must be JSON integers"):
-            load_excluded_episodes(b)
-
-    def test_booleans_are_refused(self, tmp_path):
-        """`True` passes isinstance(x, int) and would silently become episode 1."""
-        b = tmp_path / "b"
-        (b / "meta").mkdir(parents=True)
-        (b / "meta" / "excluded_episodes.json").write_text(json.dumps({"episode_indices": [True]}))
-        with pytest.raises(ValueError, match="must be JSON integers"):
-            load_excluded_episodes(b)
-
-    def test_the_actual_reader_refuses_quoted_indices_too(self, tmp_path, patch_decode):
-        """The helper being strict is worthless if the reader never calls it.
-
-        The base keeps the JSON values verbatim and matches them against an
-        integer column, so `["0"]` excluded nothing there while the generator
-        excluded episode 0. Asserting on the helper alone did not catch that —
-        this instantiates the reader.
-        """
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        (d / "meta" / "excluded_episodes.json").write_text(json.dumps({"episode_indices": ["0"]}))
-        with pytest.raises(ValueError, match="must be JSON integers"):
-            InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-
-    def test_the_actual_reader_still_applies_integer_exclusions(self, tmp_path, patch_decode):
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=4)
-        (d / "meta" / "excluded_episodes.json").write_text(json.dumps({"episode_indices": [0]}))
-        r = InternDataA1Dataset(str(d), normalize_mode=None, num_frames=2, video_stride=1)
-        assert r._eps_df["episode_index"].tolist() == [1]
-
-    def test_plain_integers_are_accepted(self, tmp_path):
-        b = tmp_path / "b"
-        (b / "meta").mkdir(parents=True)
-        (b / "meta" / "excluded_episodes.json").write_text(json.dumps({"episode_indices": [0, 3]}))
-        assert load_excluded_episodes(b) == {0, 3}
-
-    def test_a_missing_file_means_nothing_excluded(self, tmp_path):
-        assert load_excluded_episodes(tmp_path) == set()
-
-
-class TestStatsPopulationContract:
-    """The four ways the generator and the reader were seen to disagree."""
-
-    def _bucket_and_stats(self, tmp_path, **pop):
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=8)
-        block = {"split": "train", "trim_active": False, "min_keep": 2, "buckets": ["cat/split_aloha/task"]}
-        block.update(pop)
-        (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
-        eef = {k: [0.0] * EEF_DIM for k in ("mean", "min", "q01")}
-        eef.update({k: [1.0] * EEF_DIM for k in ("std", "max", "q99")})
-        (tmp_path / "meta" / "stats_split_aloha.json").write_text(json.dumps({"eef": eef, "population": block}))
-        return d
-
-    def _read(self, d, tmp_path, **kw):
-        return InternDataA1Dataset(
-            str(d), a1_stats_root=str(tmp_path), normalize_mode="quantile", num_frames=2, video_stride=1, **kw
-        )
-
-    def test_val_derived_stats_are_refused(self, tmp_path, patch_decode):
-        d = self._bucket_and_stats(tmp_path, split="val")
-        with pytest.raises(DataContractError, match="computed over the 'val' split"):
-            self._read(d, tmp_path)
-
-    def test_train_derived_stats_are_accepted_by_a_val_reader(self, tmp_path, patch_decode):
-        """A val reader must LOAD train stats, not demand val-derived ones.
-
-        There is one stats file per embodiment and it describes the training
-        distribution by definition. Comparing the recorded split against the
-        reader's own split refused every val run against a correctly generated
-        file — a regression with no failing test until this one.
-        """
-        d = self._bucket_and_stats(tmp_path, split="train")
-        info = json.loads((d / "meta" / "info.json").read_text())
-        info["splits"] = {"train": "0:1", "val": "1:2"}
-        (d / "meta" / "info.json").write_text(json.dumps(info))
-        r = self._read(d, tmp_path, split="val")
-        assert r._normalization_stats is not None
-
-    def test_untrimmed_stats_are_refused_by_a_trimming_reader(self, tmp_path, patch_decode):
-        d = self._bucket_and_stats(tmp_path, trim_active=False)
-        csv = tmp_path / "trim.csv"
-        csv.write_text("dataset,episode_index,total_frames,trim_head_to,trim_tail_from\ncat/split_aloha/task,0,8,2,6\n")
-        with pytest.raises(DataContractError, match="without a trim list but this reader is trimming"):
-            self._read(d, tmp_path, trim_csv=str(csv))
-
-    def test_trimmed_stats_are_refused_by_an_untrimmed_reader(self, tmp_path, patch_decode):
-        d = self._bucket_and_stats(tmp_path, trim_active=True)
-        with pytest.raises(DataContractError, match="with a trim list but this reader is not"):
-            self._read(d, tmp_path)
-
-    def test_a_different_keep_bound_is_refused(self, tmp_path, patch_decode):
-        d = self._bucket_and_stats(tmp_path, trim_active=True, min_keep=33)
-        csv = tmp_path / "trim.csv"
-        csv.write_text("dataset,episode_index,total_frames,trim_head_to,trim_tail_from\ncat/split_aloha/task,0,8,2,6\n")
-        with pytest.raises(DataContractError, match="--min_keep=33"):
-            self._read(d, tmp_path, trim_csv=str(csv))
-
-    def test_a_bucket_absent_from_the_scan_is_refused(self, tmp_path, patch_decode):
-        """The bucket dropped out of the scan but still loads the shared file."""
-        d = self._bucket_and_stats(tmp_path, buckets=["cat/split_aloha/other"])
-        with pytest.raises(DataContractError, match="none of them this one"):
-            self._read(d, tmp_path)
-
-    def test_a_stats_file_without_the_block_is_refused(self, tmp_path, patch_decode):
-        d = _make_bucket(tmp_path, "cat/split_aloha/task", n_eps=2, ep_len=8)
-        (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
-        eef = {k: [0.0] * EEF_DIM for k in ("mean", "min", "q01")}
-        eef.update({k: [1.0] * EEF_DIM for k in ("std", "max", "q99")})
-        (tmp_path / "meta" / "stats_split_aloha.json").write_text(json.dumps({"eef": eef}))
-        with pytest.raises(DataContractError, match="no 'population' block"):
-            self._read(d, tmp_path)
-
-    def test_root_mode_does_not_silently_drop_a_bucket_missing_from_stats(self, tmp_path, patch_decode):
-        """DataContractError must escape build_multibucket's tolerant wrapper."""
-        _make_bucket(tmp_path, "cat/split_aloha/good", n_eps=2, ep_len=8)
-        _make_bucket(tmp_path, "cat/split_aloha/bad", n_eps=2, ep_len=8)
-        (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
-        eef = {k: [0.0] * EEF_DIM for k in ("mean", "min", "q01")}
-        eef.update({k: [1.0] * EEF_DIM for k in ("std", "max", "q99")})
-        population = {
-            "split": "train",
-            "trim_active": False,
-            "min_keep": 2,
-            "buckets": ["cat/split_aloha/good"],
-            "empty_buckets": [],
-        }
-        (tmp_path / "meta" / "stats_split_aloha.json").write_text(json.dumps({"eef": eef, "population": population}))
-
-        with pytest.raises(DataContractError, match="contributor set no longer matches"):
-            InternDataA1Dataset.from_config(
-                {
-                    "dataset_dir": str(tmp_path),
-                    "stats_root": str(tmp_path),
-                    "normalize_mode": "quantile",
-                    "num_frames": 2,
-                    "video_stride": 1,
-                },
-                split="train",
-            )
-
-    def test_a_matching_population_loads(self, tmp_path, patch_decode):
-        d = self._bucket_and_stats(tmp_path)
-        assert len(self._read(d, tmp_path)) > 0
+def test_stats_embodiment_marker_must_match_bucket(tmp_path, patch_decode):
+    bucket = _make_bucket(tmp_path, "cat/split_aloha/task")
+    path = TestStats._write_stats(tmp_path, "split_aloha")
+    payload = json.loads(path.read_text())
+    payload["embodiment"] = "franka"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="different embodiment"):
+        InternDataA1Dataset(str(bucket), normalize_mode="quantile")

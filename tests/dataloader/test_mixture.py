@@ -198,3 +198,34 @@ class TestSetEpoch:
         epoch_3_map = m._index_map
         m.set_epoch(3)
         assert m._index_map is epoch_3_map
+
+
+@pytest.mark.parametrize("seed", [0, 42])
+def test_mixture_preserves_legacy_seeded_order_without_extra_maps(fake_dataset_factory, seed):
+    datasets = [fake_dataset_factory(7), fake_dataset_factory(11)]
+    mixture = MixtureDataset(datasets, weights=[1.0, 4.0], seed=seed)
+    for epoch in (0, 3):
+        mixture.set_epoch(epoch)
+        parts = []
+        for di, (dataset, weight) in enumerate(zip(datasets, mixture.weights)):
+            count = max(1, round(18 * weight))
+            parts.append(
+                np.stack(
+                    [
+                        np.full(count, di, dtype=np.int32),
+                        (np.arange(count, dtype=np.int64) % len(dataset)).astype(np.int32),
+                    ],
+                    axis=1,
+                )
+            )
+        legacy = np.concatenate(parts)
+        legacy = legacy[np.random.RandomState(seed + epoch * 7919).permutation(len(legacy))]
+        np.testing.assert_array_equal(mixture._index_map, legacy)
+        assert mixture._index_map.dtype == np.int32
+        assert mixture.dataset_sample_counts() == {"source_0": 4, "source_1": 14}
+
+
+@pytest.mark.parametrize("weights", [[float("nan"), 1.0], [float("inf"), 1.0], [1e308, 1e308]])
+def test_mixture_rejects_nonfinite_weights(fake_dataset_factory, weights):
+    with pytest.raises(ValueError, match="finite"):
+        MixtureDataset([fake_dataset_factory(3), fake_dataset_factory(4)], weights=weights)

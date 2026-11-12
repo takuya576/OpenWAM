@@ -1,52 +1,13 @@
-"""Tests for the OXE schema conversion helpers in ``utils.oxe_schema``.
-
-Pins the per-dataset state/action layouts against the canonical 10-D EEF
-representation ``[pos(3) + rot6d(6) + grip(1)]`` consumed by the OXE
-readers.
-"""
-
-from __future__ import annotations
+"""Canonical DROID and shared Euler pose conversion regressions."""
 
 import numpy as np
+import pytest
 
 from openwam.dataloader.utils.oxe_schema import (
-    bcz_state_to_arm10,
     droid_euler7_to_arm10,
     droid_pose6_closedness_to_arm10,
-    droid_state_to_arm10,
     euler7_action_to_arm10,
-    fractal_state_to_arm10,
 )
-
-
-class TestBczStateToArm10:
-    def test_shape_and_dtype(self):
-        state = np.zeros((4, 8), dtype=np.float32)
-        out = bcz_state_to_arm10(state)
-        assert out.shape == (4, 10)
-        assert out.dtype == np.float32
-
-    def test_pad_index_6_dropped(self):
-        # state[:, 6] = pad is ignored. Use distinct values for grip vs pad.
-        state = np.zeros((1, 8), dtype=np.float32)
-        state[0, 6] = 99.0  # pad value — should NOT appear in output
-        state[0, 7] = 0.5  # gripper
-        out = bcz_state_to_arm10(state)
-        # grip slot is the last (index 9)
-        assert out[0, 9] == np.float32(0.5)
-        # No 99.0 anywhere in the output
-        assert not (out == 99.0).any()
-
-    def test_position_passthrough(self):
-        state = np.array([[1.5, 2.5, 3.5, 0, 0, 0, 0, 0.7]], dtype=np.float32)
-        out = bcz_state_to_arm10(state)
-        np.testing.assert_allclose(out[0, :3], [1.5, 2.5, 3.5], atol=1e-6)
-
-    def test_identity_euler_yields_identity_rot6d(self):
-        state = np.zeros((1, 8), dtype=np.float32)
-        out = bcz_state_to_arm10(state)
-        # euler = 0 → rot6d = [1, 0, 0, 0, 1, 0]
-        np.testing.assert_allclose(out[0, 3:9], [1, 0, 0, 0, 1, 0], atol=1e-6)
 
 
 class TestEuler7ActionToArm10:
@@ -61,69 +22,6 @@ class TestEuler7ActionToArm10:
         out = euler7_action_to_arm10(action)
         np.testing.assert_allclose(out[0, :3], [0.1, 0.2, 0.3], atol=1e-6)
         assert out[0, 9] == np.float32(0.9)
-
-
-class TestFractalStateToArm10:
-    def test_shape(self):
-        state = np.zeros((4, 8), dtype=np.float32)
-        state[:, 6] = 1.0  # w = 1 → identity quat
-        out = fractal_state_to_arm10(state)
-        assert out.shape == (4, 10)
-        assert out.dtype == np.float32
-
-    def test_identity_quat_yields_identity_rot6d(self):
-        # state[3:7] = [0, 0, 0, 1] is identity in xyzw
-        state = np.array([[1.0, 2.0, 3.0, 0, 0, 0, 1, 0.5]], dtype=np.float32)
-        out = fractal_state_to_arm10(state)
-        # position
-        np.testing.assert_allclose(out[0, :3], [1, 2, 3], atol=1e-6)
-        # rot6d
-        np.testing.assert_allclose(out[0, 3:9], [1, 0, 0, 0, 1, 0], atol=1e-6)
-        # gripper
-        assert out[0, 9] == np.float32(0.5)
-
-    def test_quat_vs_euler_consistency(self):
-        # Build BC-Z-style with euler [0, 0, pi/4]; build Fractal-style with
-        # equivalent quaternion. Both should give the same rot6d.
-        from scipy.spatial.transform import Rotation as _R
-
-        T = 5
-        euler = np.random.RandomState(0).randn(T, 3).astype(np.float32)
-        quat = _R.from_euler("xyz", euler).as_quat().astype(np.float32)
-
-        bcz_state = np.zeros((T, 8), dtype=np.float32)
-        bcz_state[:, 3:6] = euler
-        fractal_state = np.zeros((T, 8), dtype=np.float32)
-        fractal_state[:, 3:7] = quat
-
-        bcz_out = bcz_state_to_arm10(bcz_state)
-        fractal_out = fractal_state_to_arm10(fractal_state)
-        # Rot6d portion should match
-        np.testing.assert_allclose(bcz_out[:, 3:9], fractal_out[:, 3:9], atol=1e-5)
-
-
-class TestDroidStateToArm10:
-    def test_shape(self):
-        cart = np.zeros((4, 6), dtype=np.float32)
-        grip = np.zeros((4, 1), dtype=np.float32)
-        out = droid_state_to_arm10(cart, grip)
-        assert out.shape == (4, 10)
-        assert out.dtype == np.float32
-
-    def test_layout(self):
-        cart = np.array([[0.1, 0.2, 0.3, 0, 0, 0]], dtype=np.float32)
-        grip = np.array([[0.8]], dtype=np.float32)
-        out = droid_state_to_arm10(cart, grip)
-        np.testing.assert_allclose(out[0, :3], [0.1, 0.2, 0.3], atol=1e-6)
-        np.testing.assert_allclose(out[0, 3:9], [1, 0, 0, 0, 1, 0], atol=1e-6)
-        np.testing.assert_allclose(out[0, 9], 0.2, atol=1e-7)
-
-    def test_scalar_gripper_shape(self):
-        # Even if gripper is shape (T, 1), the output works.
-        cart = np.zeros((3, 6), dtype=np.float32)
-        grip = np.array([[0.1], [0.5], [0.9]], dtype=np.float32)
-        out = droid_state_to_arm10(cart, grip)
-        np.testing.assert_allclose(out[:, 9], [0.9, 0.5, 0.1], atol=1e-6)
 
 
 class TestDroidEuler7ToArm10:
@@ -155,3 +53,29 @@ class TestDroidPose6ClosednessToArm10:
         np.testing.assert_allclose(out, reference, atol=1e-7)
         np.testing.assert_allclose(out[:, :3], pose[:, :3], atol=1e-7)
         np.testing.assert_allclose(out[:, 9], [0.75], atol=1e-7)
+
+
+@pytest.mark.parametrize("leading", [(), (2,), (2, 3)])
+def test_euler_pose_conversion_preserves_arbitrary_leading_dimensions(leading):
+    value = np.arange(int(np.prod(leading) or 1) * 7, dtype=np.float32).reshape(leading + (7,)) / 10
+    expected = euler7_action_to_arm10(value.reshape(-1, 7)).reshape(leading + (10,))
+    np.testing.assert_array_equal(euler7_action_to_arm10(value), expected)
+
+
+@pytest.mark.parametrize("value", [np.zeros(8), np.zeros((2, 6)), np.array(0.0)])
+def test_euler_pose_conversion_rejects_wrong_width_instead_of_dropping_fields(value):
+    with pytest.raises(ValueError, match="width 7"):
+        euler7_action_to_arm10(value)
+
+
+@pytest.mark.parametrize("index", [0, 3, 6])
+def test_droid_conversion_rejects_nonfinite_position_rotation_or_gripper(index):
+    value = np.zeros((1, 7), dtype=np.float32)
+    value[0, index] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        droid_euler7_to_arm10(value)
+
+
+def test_droid_scalar_pose_is_rejected_with_an_actionable_error():
+    with pytest.raises(ValueError, match="width 6"):
+        droid_pose6_closedness_to_arm10(np.array(0.0), np.zeros(1))

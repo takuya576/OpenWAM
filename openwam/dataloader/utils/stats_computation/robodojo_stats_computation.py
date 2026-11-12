@@ -49,7 +49,7 @@ from openwam.dataloader.utils.normalization import (
     STAT_KEYS,
     pin_rot6d_identity,
 )
-from openwam.dataloader.utils.stats_computation.robocoin_stats_computation import (
+from openwam.dataloader.utils.stats_computation.accumulator import (
     Accumulator,
 )
 

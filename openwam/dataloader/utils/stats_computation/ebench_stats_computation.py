@@ -36,7 +36,7 @@ from openwam.dataloader.ebench import (
 )
 from openwam.dataloader.utils.eef import assert_unit_quaternion
 from openwam.dataloader.utils.normalization import ROT6D_DIMS_EEF20, pin_rot6d_identity
-from openwam.dataloader.utils.stats_computation.robocoin_stats_computation import Accumulator
+from openwam.dataloader.utils.stats_computation.accumulator import Accumulator
 
 
 def _validated_raw23(frame: pd.DataFrame, action_keys: Sequence[str], ctx: str) -> np.ndarray:

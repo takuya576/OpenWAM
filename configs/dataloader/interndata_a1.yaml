@@ -1,0 +1,30 @@
+type: interndata_a1
+
+# Family root with native LeRobot v3 buckets and meta/stats_<embodiment>.json.
+# Raw arm poses use *_ee_to_robot_pose, independently of the gripper motion.
+dataset_dir: /mnt/data/wangyuran/pretrain_data_final/InternData-A1
+
+# Windows preserve episode boundaries and align video with action/state samples.
+num_frames: 33
+video_stride: 4
+window_stride: 1
+height: 384
+width: 320
+multiview: true
+split: train
+
+# Stored normalization statistics are read from the dataset's meta directory.
+normalize_mode: quantile
+enable_action_supervision: true
+unify_action: true
+unify_action_map: ["0-9", "34-43"]
+
+# One consistent augmentation per training clip.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# Optional reproducible footage budget; null loads the complete dataset.
+total_hours: null

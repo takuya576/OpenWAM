@@ -98,9 +98,14 @@ class MixtureDataset(BaseDataset):
             weights = [float(len(d)) for d in self._datasets]
         if len(weights) != len(self._datasets):
             raise ValueError(f"weights length ({len(weights)}) != datasets length ({len(self._datasets)})")
+        weights = [float(w) for w in weights]
+        if not all(np.isfinite(w) for w in weights):
+            raise ValueError(f"MixtureDataset: weights must be finite: {weights}")
         if any(w < 0 for w in weights):
             raise ValueError(f"MixtureDataset: negative weights are not allowed: {weights}")
         total_w = sum(weights)
+        if not np.isfinite(total_w):
+            raise ValueError("MixtureDataset: the sum of weights must be finite")
         if total_w <= 0:
             raise ValueError("MixtureDataset: all sub-sources are empty or zero-weight; nothing to sample.")
         self._weights = [w / total_w for w in weights]
@@ -128,7 +133,7 @@ class MixtureDataset(BaseDataset):
         ===================================================================
         ⚠️  CALLER REQUIREMENT — READ BEFORE USE  ⚠️
 
-        This method mutates ``self._index_map`` in place. Under
+        This method replaces ``self._index_map``. Under
         ``torch.utils.data.DataLoader`` with ``num_workers > 0``, each
         worker holds a forked copy of the dataset object; calling
         ``set_epoch`` on the parent only updates the parent's copy. To make
@@ -171,27 +176,41 @@ class MixtureDataset(BaseDataset):
         """
 
         total_real = sum(len(d) for d in self._datasets)
-        parts: List[np.ndarray] = []
+        entries = []
+        self._virtual_counts = [0] * len(self._datasets)
         for di, (ds, w) in enumerate(zip(self._datasets, self._weights)):
             n_real = len(ds)
             if n_real == 0 or w <= 0.0:
                 logger.warning(
-                    "MixtureDataset: skipping source '%s' (len=%d, weight=%.4f) — not sampled.",
+                    "MixtureDataset: skipping source '%s' (len=%d, weight=%.4f); not sampled.",
                     self._names[di],
                     n_real,
                     w,
                 )
                 continue
+            if n_real - 1 > np.iinfo(np.int32).max:
+                raise ValueError(f"MixtureDataset: source '{self._names[di]}' exceeds the int32 sample-index range")
             virtual_n = max(1, round(total_real * w))
-            sample_idx = (np.arange(virtual_n, dtype=np.int64) % n_real).astype(np.int32)
-            di_arr = np.full(virtual_n, di, dtype=np.int32)
-            parts.append(np.stack([di_arr, sample_idx], axis=1))
-        if not parts:
+            self._virtual_counts[di] = virtual_n
+            entries.append((di, n_real, virtual_n))
+        if not entries:
             raise RuntimeError("MixtureDataset: all sub-sources are empty or zero-weight; nothing to sample.")
-        combined = np.concatenate(parts, axis=0)
-        rng = np.random.RandomState(self._seed)
-        perm = rng.permutation(len(combined))
-        self._index_map = combined[perm]
+
+        # Four-source pretraining has hundreds of millions of windows. Fill one
+        # map with bounded temporary storage, then shuffle its rows in place;
+        # this keeps the legacy seeded order without a second map/permutation.
+        combined = np.empty((sum(self._virtual_counts), 2), dtype=np.int32)
+        offset = 0
+        block_size = 1_000_000
+        for di, n_real, virtual_n in entries:
+            combined[offset : offset + virtual_n, 0] = di
+            for start in range(0, virtual_n, block_size):
+                end = min(start + block_size, virtual_n)
+                combined[offset + start : offset + end, 1] = np.arange(start, end, dtype=np.int64) % n_real
+            offset += virtual_n
+        # One eight-byte row per shuffle item uses NumPy's fast 1-D path.
+        np.random.RandomState(self._seed).shuffle(combined.view(np.int64).reshape(-1))
+        self._index_map = combined
 
     def __getitem__(self, idx: int) -> dict:
         di, si = self._index_map[idx]
@@ -249,9 +268,7 @@ class MixtureDataset(BaseDataset):
 
     def dataset_sample_counts(self) -> Dict[str, int]:
         """Per-source virtual-sample counts, keyed by source name."""
-        di_col = self._index_map[:, 0]
-        counts = np.bincount(di_col, minlength=len(self._datasets))
-        return {self._names[i]: int(c) for i, c in enumerate(counts)}
+        return dict(zip(self._names, self._virtual_counts))
 
     @classmethod
     def from_config(cls, config, split: str = "train") -> "MixtureDataset":
@@ -259,7 +276,7 @@ class MixtureDataset(BaseDataset):
 
         Sub-sources live under the ``datasets:`` key. Two layouts:
 
-        **dict** (recommended, used by ``configs/dataloader/pretrain_data/mixture.yaml``).
+        **dict** (recommended, used by ``configs/dataloader/mixture.yaml``).
         Sub-source config is composed in via Hydra ``defaults``
         (``<name>@datasets.<name>``); the per-source block under ``datasets:``
         only carries ``enabled`` / ``weight`` overrides. The dict key is the
@@ -346,6 +363,11 @@ class MixtureDataset(BaseDataset):
             return entries
 
         weight_strategy = _get(config, "weight_strategy", "proportional")
+        valid_strategies = ("manual", "uniform", "inverse_size", "proportional")
+        if weight_strategy not in valid_strategies:
+            raise ValueError(
+                f"MixtureDataset: unknown weight_strategy={weight_strategy!r}. Valid options: {valid_strategies}."
+            )
         split_manifest = _get(config, "split_manifest")
 
         mixture_seed = int(_get(config, "seed", 42))
@@ -379,12 +401,6 @@ class MixtureDataset(BaseDataset):
         n_workers = min(len(enabled_cfgs), 16)
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             sub_datasets = list(pool.map(lambda c: build_dataset(c, split=split), enabled_cfgs))
-
-        valid_strategies = ("manual", "uniform", "inverse_size", "proportional")
-        if weight_strategy not in valid_strategies:
-            raise ValueError(
-                f"MixtureDataset: unknown weight_strategy={weight_strategy!r}. Valid options: {valid_strategies}."
-            )
 
         if weight_strategy == "uniform":
             weights = [1.0] * len(sub_datasets)

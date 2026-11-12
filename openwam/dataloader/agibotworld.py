@@ -20,25 +20,20 @@ with rot6d dimensions pinned to identity.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from pathlib import Path
 from typing import List
 
 import numpy as np
-import pandas as pd
 
 from openwam.dataloader.bases import LeRobotV3Reader, MultiLeRobotV3Reader
 from openwam.dataloader.robocoin import GRIP_EXCLUDED_DIM_MASK, _build_dex_unify_map
-from openwam.dataloader.utils.lerobotv3 import (
-    DataContractError,
-    digest_lerobot_v3_data_population,
-    resolve_lerobot_v3_data_population,
-)
+from openwam.dataloader.utils.lerobotv3 import DataContractError
 from openwam.dataloader.utils.normalization import (
     ROT6D_DIMS_EEF20,
     apply_normalization,
+    find_dataset_stats,
     materialize_eef_stats,
     pin_rot6d_identity,
 )
@@ -78,7 +73,6 @@ _GRIPPER_CONTRACT = {
     "closed_endpoint_m": _GRIPPER_STATE_CLOSED_POSITION_M,
     "output_semantics": "0_closed_1_open_aperture_fraction",
 }
-_STATS_SCHEMA_VERSION = 3
 
 
 # ``info.features`` declares both signal families, so bucket flavor is explicit.
@@ -142,99 +136,6 @@ _UNIFIED_STATS_FILENAME = "stats_g2a.json"
 
 _BUCKET_STATS_FILENAME = "stats.json"
 
-_SEGMENT_FLAG_COL = "segment_flag"
-_SEGMENT_DELTA_COL = "segment_delta"
-
-
-def _validate_trim_ratio(value) -> float | None:
-    """Normalize ``segment_max_trim_ratio`` to a float in (0, 1] or None.
-
-    Raises rather than clamping: a config typo like ``70`` (percent instead of a
-    fraction) would silently disable the filter, and ``0`` would drop every
-    episode including the untrimmed ones.
-    """
-
-    if value is None:
-        return None
-    try:
-        ratio = float(value)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"segment_max_trim_ratio must be a float in (0, 1] or null; got {value!r}") from e
-    if not np.isfinite(ratio) or not 0.0 < ratio <= 1.0:
-        raise ValueError(
-            f"segment_max_trim_ratio must be a fraction in (0, 1] or null; got {ratio!r}. "
-            "Use 0.7 for '70% or more of the episode trimmed', not 70."
-        )
-    return ratio
-
-
-def _apply_segment_annotations(
-    eps_df: pd.DataFrame,
-    *,
-    use_segment_annotations: bool,
-    segment_max_trim_ratio: float | None,
-) -> tuple[pd.DataFrame, dict]:
-    """Return the exact episode population admitted by the segment cleanup.
-
-    This is deliberately shared by the training reader and the normalization-
-    stats producer.  Keeping the policy in one function prevents a stats rerun
-    from accidentally pooling the leading/trailing frames that the reader can
-    never serve.
-    """
-
-    ratio = _validate_trim_ratio(segment_max_trim_ratio)
-    summary = {
-        "missing_columns": False,
-        "dropped_static": 0,
-        "dropped_empty": 0,
-        "dropped_over_trim": 0,
-    }
-    if not use_segment_annotations:
-        return eps_df.reset_index(drop=True), summary
-    if _SEGMENT_FLAG_COL not in eps_df.columns or _SEGMENT_DELTA_COL not in eps_df.columns:
-        summary["missing_columns"] = True
-        return eps_df.reset_index(drop=True), summary
-
-    out = eps_df.copy()
-    flag = out[_SEGMENT_FLAG_COL].fillna(0).astype(np.int64).to_numpy()
-    delta = np.maximum(0, out[_SEGMENT_DELTA_COL].fillna(0).astype(np.int64).to_numpy())
-    length = out["length"].astype(np.int64).to_numpy()
-
-    valid_start = np.zeros(len(out), dtype=np.int64)
-    valid_end = length.copy()
-    start_mask = flag == 1
-    end_mask = flag == 2
-    valid_start[start_mask] = np.minimum(delta[start_mask], length[start_mask])
-    valid_end[end_mask] = np.maximum(0, length[end_mask] - delta[end_mask])
-
-    keep = (flag != 3) & (valid_end > valid_start)
-    summary["dropped_static"] = int(np.sum(flag == 3))
-    summary["dropped_empty"] = int(np.sum((flag != 3) & (valid_end <= valid_start)))
-
-    if ratio is not None:
-        trimmed = np.maximum(0, length - np.maximum(0, valid_end - valid_start))
-        with np.errstate(invalid="ignore", divide="ignore"):
-            trim_ratio = np.where(length > 0, trimmed / np.maximum(length, 1), 0.0)
-        over = (flag != 3) & keep & (trim_ratio >= ratio)
-        summary["dropped_over_trim"] = int(np.sum(over))
-        keep = keep & ~over
-
-    out["_valid_start"] = valid_start
-    out["_valid_end"] = valid_end
-    return out.loc[keep].reset_index(drop=True), summary
-
-
-def _effective_segment_population_digest(eps_df: pd.DataFrame) -> str:
-    """Hash the kept ``(episode, start, end)`` ranges in reader order."""
-    hasher = hashlib.sha256(b"openwam:agibotworld-segment-population:v1\0")
-    ordered = eps_df.sort_values("episode_index", kind="stable")
-    for _, row in ordered.iterrows():
-        start = int(row.get("_valid_start", 0))
-        end = int(row.get("_valid_end", row["length"]))
-        for value in (int(row["episode_index"]), start, end):
-            hasher.update(value.to_bytes(8, "little", signed=False))
-    return hasher.hexdigest()
-
 
 def _bucket_base_motion_flags(dataset_dir) -> tuple[bool, bool]:
     """Return independent ``(action_moves, state_moves)`` flags for a bucket.
@@ -245,29 +146,18 @@ def _bucket_base_motion_flags(dataset_dir) -> tuple[bool, bool]:
     mobile buckets: action slots 68/70 remain supervised while all-zero state
     slots are absent from the proprio mask.
 
-    A missing / unreadable stats file returns ``(False, False)`` and logs a
-    warning, so no fabricated constant-zero movement is supervised.
+    Missing or unreadable bucket stats fail immediately: silently treating a
+    mobile bucket as stationary would remove real supervision.
     """
 
     p = Path(dataset_dir) / "meta" / _BUCKET_STATS_FILENAME
-    if not p.exists():
-        logger.warning(
-            "AgiBotWorld %s: no %s — treating base as stationary (move slots unmapped).",
-            dataset_dir,
-            _BUCKET_STATS_FILENAME,
-        )
-        return False, False
     try:
-        with open(p) as f:
-            st = json.load(f)
-    except (OSError, ValueError) as e:
-        logger.warning(
-            "AgiBotWorld %s: could not read %s (%s) — treating base as stationary (move slots unmapped).",
-            dataset_dir,
-            p.name,
-            e,
-        )
-        return False, False
+        with p.open(encoding="utf-8") as stream:
+            st = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise DataContractError(f"Cannot load AgiBotWorld movement statistics from {p}: {exc}") from exc
+    if not isinstance(st, dict):
+        raise DataContractError(f"AgiBotWorld movement statistics {p} must contain a mapping.")
 
     flags = []
     for key in ("action.robot_velocity", "observation.state.robot_velocity"):
@@ -275,9 +165,14 @@ def _bucket_base_motion_flags(dataset_dir) -> tuple[bool, bool]:
         if not blk:
             flags.append(False)
             continue
-        lo = np.abs(np.asarray(blk.get("min", [0.0]), dtype=np.float64)).max()
-        hi = np.abs(np.asarray(blk.get("max", [0.0]), dtype=np.float64)).max()
-        flags.append(bool(max(lo, hi) > _MOVE_EPS))
+        if not isinstance(blk, dict):
+            raise DataContractError(f"{p}: {key} must contain movement bounds.")
+        bounds = [np.asarray(blk.get(field), dtype=np.float64) for field in ("min", "max")]
+        if any(values.shape != (3,) or not np.isfinite(values).all() for values in bounds):
+            raise DataContractError(f"{p}: {key} min/max must contain three finite values.")
+        if np.any(bounds[0] > bounds[1]):
+            raise DataContractError(f"{p}: {key} min exceeds max.")
+        flags.append(bool(max(np.abs(values).max() for values in bounds) > _MOVE_EPS))
     return flags[0], flags[1]
 
 
@@ -324,6 +219,7 @@ class AgiBotWorldDataset(LeRobotV3Reader):
     AgiBotWorld-specific bits are overridden below.
     """
 
+    STRICT_BUCKET_LOADING = True
     DATASET_NAME = "AgiBotWorld"
     HEAD_CAMERA = HEAD_CAMERA
     LEFT_WRIST_CAMERA = LEFT_WRIST_CAMERA
@@ -334,7 +230,6 @@ class AgiBotWorldDataset(LeRobotV3Reader):
     DEFAULT_NORMALIZE_MODE = None
 
     WRIST_DECODE_TOLERATED = (Exception,)
-    CONFIG_KEYS = LeRobotV3Reader.CONFIG_KEYS + ("use_segment_annotations", "segment_max_trim_ratio")
 
     def __init__(
         self,
@@ -342,8 +237,6 @@ class AgiBotWorldDataset(LeRobotV3Reader):
         *,
         unify_action: bool = False,
         unify_action_map=None,
-        use_segment_annotations: bool = True,
-        segment_max_trim_ratio: float | None = None,
         **kwargs,
     ):
         """Detect the bucket flavor + base motion and wire the finger / move scatter.
@@ -363,14 +256,6 @@ class AgiBotWorldDataset(LeRobotV3Reader):
         Under ``unify_action=False`` no movement is emitted: grippered → 20-D EEF,
         dex → 20-D pose with grip slots masked.
 
-        Args:
-            use_segment_annotations: honor ``segment_flag`` / ``segment_delta``
-                (see :meth:`_filter_episodes`). False → full segments, the
-                pre-annotation behavior.
-            segment_max_trim_ratio: drop an episode outright when the segment trim
-                would remove at least this fraction of it (``0.7`` → an episode
-                keeping under 30% of its frames is discarded). None disables the
-                rule. Only meaningful with ``use_segment_annotations=True``.
         """
 
         self._is_dex = Path(dataset_dir).name in _DEX_BUCKET_IDS
@@ -382,15 +267,6 @@ class AgiBotWorldDataset(LeRobotV3Reader):
 
         self.ACTION_DIM_MASK = None
         self.PROPRIO_DIM_MASK = None
-        self._use_segment_annotations = bool(use_segment_annotations)
-        self._segment_max_trim_ratio = _validate_trim_ratio(segment_max_trim_ratio)
-        if self._segment_max_trim_ratio is not None and not self._use_segment_annotations:
-            logger.warning(
-                "AgiBotWorld %s: segment_max_trim_ratio=%s is ignored because "
-                "use_segment_annotations=False (there is no trim to measure).",
-                dataset_dir,
-                self._segment_max_trim_ratio,
-            )
         if unify_action:
             move_dim = _MOVE_DIM if self._has_move else 0
             move_slots = list(_MOVE_SLOTS) if self._has_move else []
@@ -409,47 +285,9 @@ class AgiBotWorldDataset(LeRobotV3Reader):
                 self.PROPRIO_DIM_MASK = proprio_mask
         super().__init__(dataset_dir, unify_action=unify_action, unify_action_map=unify_action_map, **kwargs)
 
-    def _filter_episodes(self, eps_df: pd.DataFrame) -> pd.DataFrame:
-        """Apply segment-boundary annotations to the trainable episode span.
-
-        ``segment_flag`` selects an unchanged segment, a leading trim, a
-        trailing trim, or a fully static segment to drop. ``segment_delta`` is
-        interpreted as an integer frame count.  The resulting
-        ``_valid_start``/``_valid_end`` bounds are consumed by the shared
-        window builder, keeping parquet and video slices aligned.
-
-        When configured, ``segment_max_trim_ratio`` drops a segment whose
-        boundary trim would remove at least that fraction.  Mid-segment frames
-        are never spliced or reordered.
-        """
-
-        out, summary = _apply_segment_annotations(
-            eps_df,
-            use_segment_annotations=self._use_segment_annotations,
-            segment_max_trim_ratio=self._segment_max_trim_ratio,
-        )
-        if summary["missing_columns"]:
-            logger.warning(
-                "AgiBotWorld(%s): segment annotation columns %s/%s missing; using full segments.",
-                self._dataset_id,
-                _SEGMENT_FLAG_COL,
-                _SEGMENT_DELTA_COL,
-            )
-        dropped_static = summary["dropped_static"]
-        dropped_empty = summary["dropped_empty"]
-        dropped_over_trim = summary["dropped_over_trim"]
-        if dropped_static or dropped_empty or dropped_over_trim:
-            logger.info(
-                "AgiBotWorld(%s): segment annotations dropped %d static, %d empty-after-trim and "
-                "%d over-trimmed (>=%s of the episode) episodes; kept %d episodes.",
-                self._dataset_id,
-                dropped_static,
-                dropped_empty,
-                dropped_over_trim,
-                "n/a" if self._segment_max_trim_ratio is None else f"{self._segment_max_trim_ratio:.0%}",
-                len(out),
-            )
-        return out
+    def _load_excluded_episode_indices(self) -> set[int]:
+        """The exported episodes already contain exactly the retained frames."""
+        return set()
 
     def _resolve_cameras(self, info: dict):
         """Return the fixed head/left/right cameras, record robot_type, and pick
@@ -475,123 +313,48 @@ class AgiBotWorldDataset(LeRobotV3Reader):
         return self.HEAD_CAMERA, self.LEFT_WRIST_CAMERA, self.RIGHT_WRIST_CAMERA
 
     def _load_stats(self, info: dict):
-        """Assemble SEPARATE action / state normalization stats from the unified stats file.
+        """Read the shipped family-root stats and assemble each signal layout.
 
-        Returns None (raw pass-through) unless a config opts into normalization.
-        Action and state are DISTINCT distributions — e.g. ``gripper`` is a binary
-        command in ``action.*`` but a continuous physical opening in
-        ``observation.state.*`` — so each stream gets its OWN stats, built from its
-        own ``{prefix}.ee_base`` / ``.gripper`` | ``.dex`` / ``.robot_velocity`` blocks
-        (assembled to this bucket's raw layout, rot6d dims identity-pinned since the
-        stats file is not pinned). The two blocks are stashed on the instance
-        (``_action_norm_stats`` / ``_proprio_norm_stats``) and consumed by
-        ``_action_20d`` / ``_proprio_20d`` respectively.
-
-        Stats source: the UNIFIED ``<dataset_root>/meta/stats_g2a.json`` produced by
-        agibotworld_stats_computation — one flavor-aware stats set pooled across all
-        buckets (AgiBotWorld is a single embodiment, so the same physical action should
-        normalize identically everywhere; this mirrors RoboCOIN's per-robot-type stats).
-        Each column was pooled only over the buckets where it carries signal (ee_base:
-        all; gripper: grippered buckets; dex: dex buckets; robot_velocity: the
-        independently moving buckets for that action/state stream).
-        mean/std/min/max are exact; q01/q99 are an approximate pooled estimate (merged
-        reservoirs). Every mode is valid; missing file → raise (run the stats script).
-        Under root mode ``_dataset_dir`` is a bucket, so the file lives at
-        ``_dataset_dir.parent / meta``.
+        Action/state and mobile-base distributions remain separate. No frame
+        selection or statistics generation is performed by the reader.
         """
 
         self._action_norm_stats = None
         self._proprio_norm_stats = None
         if not self._normalize_mode or self._normalize_mode in ("none", "null"):
             return None
-        stats_path = self._dataset_dir.parent / "meta" / _UNIFIED_STATS_FILENAME
-        if not stats_path.exists():
-            raise FileNotFoundError(
-                f"normalize_mode={self._normalize_mode!r} but the unified stats file {stats_path} is missing. "
-                f"Run `python -m openwam.dataloader.utils.stats_computation.agibotworld_stats_computation "
-                f"--dataset_dir {self._dataset_dir.parent}` to generate it, or set normalize_mode=null to disable."
-            )
-        with open(stats_path) as f:
+        stats_path = find_dataset_stats(self._dataset_dir, _UNIFIED_STATS_FILENAME, family_root=self._stats_root)
+        with open(stats_path, encoding="utf-8") as f:
             raw = json.load(f)
 
+        if not isinstance(raw, dict):
+            raise DataContractError(f"{stats_path} must contain a statistics mapping.")
         if raw.get("gripper_contract") != _GRIPPER_CONTRACT:
             raise DataContractError(
                 f"AgiBotWorld stats {stats_path} use gripper_contract="
                 f"{raw.get('gripper_contract')!r}; expected {_GRIPPER_CONTRACT!r}. "
-                "Regenerate stats with the current canonical direction and endpoint calibration."
+                "Use the stats shipped with the cleaned AgiBotWorld export."
             )
-
-        population = raw.get("population")
-        if not isinstance(population, dict) or population.get("schema_version") != _STATS_SCHEMA_VERSION:
-            raise DataContractError(
-                f"AgiBotWorld stats {stats_path} use stale population schema "
-                f"{None if not isinstance(population, dict) else population.get('schema_version')!r}; "
-                f"expected {_STATS_SCHEMA_VERSION}. Regenerate it to bind the canonical gripper "
-                "contract, independent action/state velocity populations, and terminal-action exclusion."
-            )
-        recorded_buckets = population.get("buckets")
-        if not isinstance(recorded_buckets, dict) or not all(
-            isinstance(name, str) and name for name in recorded_buckets
-        ):
-            raise DataContractError(
-                f"AgiBotWorld stats {stats_path} has a malformed pooled contributor map; regenerate stats."
-            )
-
-        current_buckets = {
-            path.name
-            for path in self._dataset_dir.parent.iterdir()
-            if path.is_dir() and (path / "meta" / "info.json").is_file()
-        }
-        recorded_bucket_names = set(recorded_buckets)
-        if recorded_bucket_names != current_buckets:
-            missing = sorted(current_buckets - recorded_bucket_names)
-            extra = sorted(recorded_bucket_names - current_buckets)
-            raise DataContractError(
-                f"AgiBotWorld stats {stats_path} pooled contributor set no longer matches "
-                f"the current dataset root (missing={missing}, extra={extra}); regenerate stats."
-            )
-        if population.get("split") != "train":
-            raise DataContractError(
-                f"AgiBotWorld stats {stats_path} were generated from split={population.get('split')!r}; "
-                "normalization statistics must be train-derived. Regenerate with --split train."
-            )
-        expected_annotations = bool(population.get("use_segment_annotations"))
-        expected_ratio = _validate_trim_ratio(population.get("segment_max_trim_ratio"))
-        if expected_annotations != self._use_segment_annotations or expected_ratio != self._segment_max_trim_ratio:
-            raise DataContractError(
-                f"AgiBotWorld stats {stats_path} were generated with "
-                f"use_segment_annotations={expected_annotations}, segment_max_trim_ratio={expected_ratio}, "
-                f"but bucket {self._dataset_id} loads with "
-                f"use_segment_annotations={self._use_segment_annotations}, "
-                f"segment_max_trim_ratio={self._segment_max_trim_ratio}. Regenerate stats with matching settings."
-            )
-        bucket_population = recorded_buckets.get(self._dataset_id)
-        if not isinstance(bucket_population, dict):
-            raise DataContractError(
-                f"AgiBotWorld bucket {self._dataset_id} has no population record in {stats_path}; regenerate stats."
-            )
-        disk_population = resolve_lerobot_v3_data_population(self._dataset_dir, info=info)
-        disk_digest = digest_lerobot_v3_data_population(disk_population)
-        if bucket_population.get("data_population_digest") != disk_digest:
-            raise DataContractError(
-                f"AgiBotWorld bucket {self._dataset_id} manifest/data mapping changed after {stats_path} was generated; "
-                "regenerate normalization stats."
-            )
-
-        if self._split == population.get("split") and self._max_hours is None:
-            effective_digest = _effective_segment_population_digest(self._eps_df)
-            if bucket_population.get("effective_population_digest") != effective_digest:
-                raise DataContractError(
-                    f"AgiBotWorld bucket {self._dataset_id} segment/exclusion population changed after "
-                    f"{stats_path} was generated; regenerate normalization stats."
-                )
 
         def _mat(key: str, dim: int):
             if key not in raw:
                 raise KeyError(f"AgiBotWorld bucket {self._dataset_id}: '{key}' missing from {stats_path}.")
-            return materialize_eef_stats(
-                raw[key], self._normalize_mode, dim=dim, strict_minmax=False, source_hint=f"{stats_path}: {key}"
+            block = raw[key]
+            if not isinstance(block, dict):
+                raise DataContractError(f"{stats_path}: {key} must contain a statistics mapping.")
+            for field in _STAT_FIELDS:
+                if field in block:
+                    values = np.asarray(block[field], dtype=np.float32)
+                    if values.shape != (dim,) or not np.isfinite(values).all():
+                        raise DataContractError(f"{stats_path}: {key}.{field} must contain {dim} finite values.")
+            stats = materialize_eef_stats(
+                block, self._normalize_mode, dim=dim, strict_minmax=False, source_hint=f"{stats_path}: {key}"
             )
+            if np.any(stats["std"] < 0) or any(
+                np.any(stats[low] > stats[high]) for low, high in (("min", "max"), ("q01", "q99"))
+            ):
+                raise DataContractError(f"{stats_path}: {key} has invalid normalization bounds or standard deviation.")
+            return stats
 
         def _build(prefix: str):
             """Assemble the width-matched stats block for one stream ('action' or
