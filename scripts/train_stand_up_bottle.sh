@@ -50,7 +50,6 @@ if [[ "${LORA:-0}" == "1" ]]; then
     lora_args=(
         training.lora.enabled=true
         "training.lora.lr=${LORA_LR:-5e-4}"
-        training.text_embedding_cache=true
         training.text_encoder_offload=true
     )
 fi

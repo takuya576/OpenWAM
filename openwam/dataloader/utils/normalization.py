@@ -16,6 +16,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -28,6 +29,44 @@ _NO_OP_MODES = (None, "none", "null")
 # The six stat vectors every materialized stats dict carries (also the keys
 # readers hand to ``_write_deploy_normalizer_stats``).
 STAT_KEYS = ("mean", "std", "min", "max", "q01", "q99")
+
+
+def find_dataset_stats(
+    dataset_dir: str | Path,
+    filename: str,
+    *,
+    family_root: str | Path | None = None,
+) -> Path:
+    """Find supplied statistics without escaping the dataset family.
+
+    Root-mode readers pass their configured family root. A standalone bucket
+    can infer the family from its nearest ancestor with a ``meta`` directory;
+    that directory is the boundary even when the requested file is missing.
+    The caller's lexical tree is retained so symlinked buckets can use the
+    statistics belonging to their configured family, rather than another
+    physical source tree. No statistics are created or recomputed.
+    """
+    if not filename or Path(filename).name != filename:
+        raise ValueError("The statistics filename must be a single file name.")
+    root = Path(os.path.abspath(Path(dataset_dir).expanduser()))
+    if family_root is None:
+        boundary = next((p for p in root.parents if (p / "meta").is_dir()), root)
+    else:
+        boundary = Path(os.path.abspath(Path(family_root).expanduser()))
+        if root != boundary and boundary not in root.parents:
+            raise ValueError(f"Dataset bucket {root} is outside its statistics family {boundary}.")
+    for parent in (root, *root.parents):
+        candidate = parent / "meta" / filename
+        if candidate.is_file():
+            return candidate
+        if parent == boundary:
+            break
+    raise FileNotFoundError(
+        f"Precomputed normalization statistics {filename!r} were not found "
+        f"between {root}/meta and dataset family {boundary}/meta. "
+        "Keep the supplied statistics with the dataset."
+    )
+
 
 # rot6d dims within the two EEF stat layouts:
 #   10-D single-arm  [pos(0:3), rot6d(3:9), grip(9)]                 (OXE)
@@ -135,7 +174,7 @@ def apply_normalization(
         if "q01" not in stats or "q99" not in stats:
             raise KeyError(
                 "quantile normalization requires stats['q01'] and stats['q99']; "
-                "rerun the OXE compute_stats script to populate quantile fields."
+                "provide the dataset's precomputed statistics with both quantile fields."
             )
         q01 = stats["q01"]
         q99 = stats["q99"]
@@ -201,6 +240,18 @@ def materialize_eef_stats(
         "q99": np.array(raw.get("q99", [1.0] * dim), dtype=np.float32),
     }
 
+    # Check supplied values before identity pinning can hide malformed fields.
+    for key, values in out.items():
+        if values.shape != (dim,):
+            raise ValueError(f"Normalization stats {key!r} must have shape ({dim},), got {values.shape}. {source_hint}")
+        if not np.isfinite(values).all():
+            raise ValueError(f"Normalization stats {key!r} contain non-finite values. {source_hint}")
+    if np.any(out["std"] < 0):
+        raise ValueError(f"Normalization standard deviation must be non-negative. {source_hint}")
+    for lower, upper in (("min", "max"), ("q01", "q99")):
+        if np.any(out[lower] > out[upper]):
+            raise ValueError(f"Normalization stats require {lower} <= {upper}. {source_hint}")
+
     rot6d_dims = _ROT6D_DIMS_BY_WIDTH.get(dim)
     if force_rot6d_identity and rot6d_dims is not None:
         pin_rot6d_identity(out, rot6d_dims)
@@ -217,7 +268,7 @@ def materialize_eef_stats(
             logger.warning(
                 "rot6d dims %s of this stats file are not identity under mode=%r — the file "
                 "likely predates rot6d identity pinning and normalization WILL distort the "
-                "rotation representation. Rerun the matching *_stats_computation script. %s",
+                "rotation representation. Provide statistics matching the dataset's action representation. %s",
                 idx,
                 mode,
                 source_hint,
@@ -291,6 +342,7 @@ def _load_raw_stats(path: str, action_mode: Optional[str]) -> Mapping:
 
 __all__ = [
     "apply_normalization",
+    "find_dataset_stats",
     "load_stats_file",
     "load_stats_metadata",
     "materialize_eef_stats",

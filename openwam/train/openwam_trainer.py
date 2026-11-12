@@ -29,6 +29,7 @@ import os
 import torch
 from omegaconf import DictConfig
 
+from openwam.dataloader.collate import openwam_collate
 from openwam.train.utils.checkpointing import (
     compute_resume_position,
     finalize_keep_weights_only,
@@ -41,7 +42,9 @@ from openwam.train.utils.checkpointing import (
     save_weights,
     verify_resume_normalization_stats,
 )
+from openwam.train.utils.grad_accumulation import scale_loss_for_backward
 from openwam.train.utils.optimizer_groups import build_trainable_parameters
+from openwam.train.utils.runtime_tuning import maybe_freeze_gc
 from openwam.train.utils.seeding import per_step_seed, seed_process, wire_sampler_seed
 from openwam.train.utils.training_utils import (
     build_constant_scheduler,
@@ -90,6 +93,14 @@ class OpenWAMTrainer:
 
         # Build architecture (creates video_backbone internally from config).
         from openwam.model import build_architecture, resolve_architecture_config
+        from openwam.model.architectures.base import validate_gradient_checkpointing_layers
+        from openwam.model.video_backbone.base import validate_text_encoder_offload
+
+        # Reject invalid memory settings before loading any model weights.
+        gradient_checkpointing_layers = validate_gradient_checkpointing_layers(
+            cfg_get(t, "gradient_checkpointing_layers", None)
+        )
+        text_encoder_offload = validate_text_encoder_offload(cfg_get(t, "text_encoder_offload", False))
 
         # Finetune/resume: build from the self-contained checkpoint dir
         # (skeletons from its config.yaml component specs, weights from its
@@ -167,21 +178,6 @@ class OpenWAMTrainer:
             if is_main:
                 print(report.summary(), flush=True)
 
-        # --- Text-encoder cost: memoize per-prompt embeddings (the encoder is
-        # frozen, so a prompt's embedding never changes) and optionally keep the
-        # encoder on CPU. Offloading needs the cache, or every step would run it there.
-        self._text_cache = bool(t.get("text_embedding_cache", False))
-        self._text_encoder_offload = bool(t.get("text_encoder_offload", False))
-        if self._text_encoder_offload and not self._text_cache:
-            raise ValueError("training.text_encoder_offload=true requires training.text_embedding_cache=true.")
-        if self._text_cache:
-            vb = self.architecture.video_backbone
-            if not hasattr(vb, "enable_train_text_cache"):
-                raise ValueError(
-                    f"training.text_embedding_cache is not supported by video backbone {type(vb).__name__}."
-                )
-            vb.enable_train_text_cache(offload_encoder=self._text_encoder_offload)
-
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
 
@@ -194,6 +190,8 @@ class OpenWAMTrainer:
         self.architecture.set_training_runtime(
             use_gradient_checkpointing=bool(t.use_gradient_checkpointing),
             use_gradient_checkpointing_offload=bool(t.use_gradient_checkpointing_offload),
+            gradient_checkpointing_layers=gradient_checkpointing_layers,
+            text_encoder_offload=text_encoder_offload,
             max_timestep_boundary=float(t.max_timestep_boundary),
             min_timestep_boundary=float(t.min_timestep_boundary),
         )
@@ -352,7 +350,8 @@ class OpenWAMTrainer:
                 with self.accelerator.accumulate(self.architecture):
                     losses = self.compute_loss(batch)
                     loss = losses["total"]
-                    self.accelerator.backward(loss)
+                    # Mean (not sum) over gradient-accumulation micro-batches on every DeepSpeed version.
+                    self.accelerator.backward(scale_loss_for_backward(self.accelerator, loss))
 
                     grad_norm = torch.tensor(0.0, device=loss.device)
                     if self.accelerator.sync_gradients:
@@ -387,6 +386,7 @@ class OpenWAMTrainer:
                     debug=debug,
                     output_path=output_path,
                 )
+                maybe_freeze_gc(global_step)  # OPENWAM_GC_FREEZE
 
                 # save_steps: write the weights line (+ the resumable full state when
                 # save_full_states_for_resume=true), then prune in lockstep.
@@ -440,7 +440,7 @@ class OpenWAMTrainer:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=int(t.dataset_num_workers),
-            collate_fn=list,
+            collate_fn=self._collate_fn(),
             pin_memory=True,
         )
         if not shuffle:
@@ -455,7 +455,17 @@ class OpenWAMTrainer:
             kwargs["worker_init_fn"] = dataloader_worker_init_fn
         return torch.utils.data.DataLoader(self.dataset, **kwargs)
 
-    # (5) Called by train() — linear warmup + cosine or constant, or None (constant LR / debug).
+    def _collate_fn(self):
+        """``list``; with ``OPENWAM_FAST_INPUT=1`` and a video backbone that takes uint8
+        clip tensors, ``openwam_collate`` (frames converted in the DataLoader workers)."""
+        if os.environ.get("OPENWAM_FAST_INPUT", "0") != "1":
+            return list
+        if getattr(getattr(self.architecture, "video_backbone", None), "accepts_uint8_clips", False):
+            return openwam_collate
+        logger.warning("OPENWAM_FAST_INPUT=1: the video backbone takes PIL frames; frames are collated as a list")
+        return list
+
+    # (5) Called by train() — linear-warmup + cosine schedule, or None (constant LR / debug).
     def build_lr_scheduler(self, optimizer, total_opt_steps: int, debug: bool = False):
         """Linear warmup + cosine or constant schedule, or None (constant LR / debug)."""
         t = self.cfg.training
@@ -558,11 +568,6 @@ class OpenWAMTrainer:
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
         arch.set_dtype_device(arch.dtype, self.accelerator.device)
         arch.move_frozen_to_device(self.accelerator.device)
-        if getattr(self, "_text_encoder_offload", False):
-            # Last device move of the run, so the encoder stays on CPU from here on;
-            # cached prompts never touch it again and misses are encoded there.
-            arch.video_backbone.apply_text_encoder_offload()
-            logger.info("Text encoder offloaded to CPU (text_embedding_cache serves the training prompts).")
         logger.info(
             "architecture wrapped (%s), device=%s",
             type(self.architecture).__name__,

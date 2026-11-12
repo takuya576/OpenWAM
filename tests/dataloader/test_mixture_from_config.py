@@ -264,3 +264,12 @@ class TestActionDimStrictMode:
         }
         m = MixtureDataset.from_config(cfg)
         assert m.action_dim == 20
+
+
+def test_invalid_strategy_fails_before_loading_sources(monkeypatch):
+    def unexpected_load(*args, **kwargs):
+        raise AssertionError("invalid mixture configuration must not scan datasets")
+
+    monkeypatch.setattr(registry_mod, "build_dataset", unexpected_load)
+    with pytest.raises(ValueError, match="unknown weight_strategy"):
+        MixtureDataset.from_config({"weight_strategy": "typo", "datasets": {"a": {"type": "robocoin"}}})

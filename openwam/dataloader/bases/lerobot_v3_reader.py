@@ -1,8 +1,8 @@
 """Unified single-bucket LeRobot v3 reader base.
 
-One base class for every LeRobot v3 single-bucket reader in this package —
-the 4 OXE readers (BC-Z / Bridge / Fractal / DROID), RoboCOIN, and EgoDex are
-all **direct, equal subclasses** of :class:`LeRobotV3Reader`. There is no
+One base class for LeRobot v3 single-bucket readers, including the four
+pretraining data sources and benchmark readers. They are
+direct subclasses of :class:`LeRobotV3Reader`. There is no
 per-family intermediate base; the differences between readers are expressed
 through a small set of hook methods + class attributes, and the genuinely
 shared building blocks (single-arm EEF assembly, stats materialization,
@@ -83,9 +83,7 @@ from openwam.dataloader.utils.lerobotv3 import (
     compute_file_local_offsets,
     effective_episode_frames,
     load_episodes_parquet,
-    load_tasks_annotated,
     parse_info_json,
-    resolve_prompt_by_episode,
     subsample_episodes_by_hours,
 )
 from openwam.dataloader.utils.normalization import materialize_eef_stats
@@ -132,6 +130,7 @@ class LeRobotV3Reader(BaseDataset):
 
     # --- subclass-overridable class attributes ---
     DATASET_NAME: ClassVar[str] = "LeRobotV3"
+    STRICT_BUCKET_LOADING: ClassVar[bool] = False
     NEEDED_COLS: ClassVar[Tuple[str, ...]] = ()
     HEAD_CAMERA: ClassVar[Optional[str]] = None
     LEFT_WRIST_CAMERA: ClassVar[Optional[str]] = None
@@ -143,9 +142,6 @@ class LeRobotV3Reader(BaseDataset):
     # ``_resolve_cameras``.
     PROPRIO_DIM_MASK: ClassVar[Optional[np.ndarray]] = None
     ACTION_DIM: ClassVar[int] = EEF_DIM
-    # Prompt convention: "task_index" (tasks.parquet, index=text — RoboCOIN /
-    # EgoDex) or "episode_annotated" (tasks_annotated.parquet by episode_index — OXE).
-    PROMPT_SOURCE: ClassVar[str] = "task_index"
     PROMPT_FILE_REQUIRED: ClassVar[bool] = True
     # In-reader normalization stats: when STATS_FILENAME is set, the default
     # ``_load_stats`` loads ``meta/<STATS_FILENAME>`` (a flat stats dict) with
@@ -163,9 +159,8 @@ class LeRobotV3Reader(BaseDataset):
     # so the artifact is authored in RAW space (NOT scattered). None → no deploy
     # stats written (default).
     DEPLOY_ACTION_MODE: ClassVar[Optional[str]] = None
-    # Default normalize_mode when the caller doesn't pass one. OXE readers
-    # override to "quantile" (their historical default); RoboCOIN/EgoDex keep
-    # None (no in-reader normalization unless a config opts in).
+    # Default normalize_mode when the caller does not pass one. A config can
+    # select the dataset's precomputed statistics or disable normalization.
     DEFAULT_NORMALIZE_MODE: ClassVar[Optional[str]] = None
     # Exception types a wrist (auxiliary-camera) decode failure is tolerated for
     # (missing / corrupt mp4 → black slot rather than a fatal sample). OXE used
@@ -185,6 +180,8 @@ class LeRobotV3Reader(BaseDataset):
         multiview: bool = False,
         normalize_mode: Any = _NORMALIZE_MODE_UNSET,
         dataset_id: Optional[str] = None,
+        # Internal root-mode boundary for supplied family normalization stats.
+        stats_root: Optional[str] = None,
         target_camera: Optional[str] = None,
         camera_layout: Optional[List[str]] = None,
         # Octo-style head-view sampling: a list of >=2 camera keys (must include
@@ -212,6 +209,7 @@ class LeRobotV3Reader(BaseDataset):
         **_unused: Any,
     ):
         self._dataset_dir = Path(dataset_dir)
+        self._stats_root = Path(stats_root) if stats_root is not None else None
         self._dataset_id = dataset_id or self._dataset_dir.name
         self._num_frames = int(num_frames)
         self._video_stride = max(1, int(video_stride))
@@ -342,12 +340,6 @@ class LeRobotV3Reader(BaseDataset):
         # LeRobot v2.1: per-episode parquet + meta/episodes.jsonl) can supply
         # the same eps DataFrame contract without reimplementing __init__.
         self._eps_df = self._build_episode_index(info)
-        # Stable universe for external scan tools' over-exclusion guardrails. Capture
-        # it before this reader applies the mutable exclusion artifact; using a
-        # post-exclusion length plus a later artifact snapshot races concurrent
-        # exclusion writers and can overstate the denominator.
-        self._n_episodes_before_exclusions = int(len(self._eps_df))
-
         # ── per-bucket episode exclusion (data-quality blacklist) ─────────
         # meta/excluded_episodes.json holds episode_index values that must not
         # be sampled (e.g. episodes whose frames fall in a truncated video
@@ -368,16 +360,7 @@ class LeRobotV3Reader(BaseDataset):
                     n_before,
                 )
 
-        # ── subclass episode filter hook (default identity) ───────────────
-        # Runs AFTER info-split + excluded_episodes.json filtering and BEFORE
-        # the offset arrays are extracted, so dropped rows stay alignment-safe
-        # (the per-row _data_row_offset / _video_frame_offset columns ride
-        # along). Ego4D overrides this to drop episodes whose bilingual prompt
-        # has no usable English half; every other reader keeps the identity
-        # default.
-        self._eps_df = self._filter_episodes(self._eps_df)
-
-        # ── optional episode-level subsample to fit a per-bucket hour budget ──
+        # Optional whole-episode subsampling to fit a per-bucket hour budget.
         if self._max_hours is not None:
             self._select_episodes_by_hours(float(self._max_hours), self._subsample_seed)
 
@@ -455,7 +438,7 @@ class LeRobotV3Reader(BaseDataset):
         This helper only changes ``_eps_df``.  The caller must rebuild the
         derived episode/window arrays afterwards.  Keeping selection separate
         lets root-mode multi-bucket construction first build every leaf against
-        its complete split/exclusion/trim population, water-fill using those
+        its complete split/exclusion population, water-fill using those
         *effective* capacities, and then apply each allocation in place.
         """
         n_before = len(self._eps_df)
@@ -489,17 +472,7 @@ class LeRobotV3Reader(BaseDataset):
 
     def _rebuild_episode_arrays(self) -> None:
         """Rebuild every array derived from the current ``_eps_df`` rows."""
-        effective_length = effective_episode_frames(self._eps_df)
-        self._ep_valid_start = (
-            self._eps_df["_valid_start"].to_numpy().astype(np.int64)
-            if "_valid_start" in self._eps_df.columns
-            else np.zeros(len(self._eps_df), dtype=np.int64)
-        )
-        self._ep_valid_end = (
-            self._eps_df["_valid_end"].to_numpy().astype(np.int64)
-            if "_valid_end" in self._eps_df.columns
-            else self._eps_df["length"].to_numpy().astype(np.int64)
-        )
+        episode_lengths = effective_episode_frames(self._eps_df)
         self._ep_data_row_offset = self._eps_df["_data_row_offset"].to_numpy().astype(np.int64)
         self._ep_video_frame_offsets = {}
         for cam in self._video_cameras():
@@ -509,8 +482,8 @@ class LeRobotV3Reader(BaseDataset):
 
         min_window_len = self._num_frames if self._split == "val" else self._train_min_window_len()
         n_starts = np.where(
-            effective_length >= min_window_len,
-            (effective_length - min_window_len) // self._window_stride + 1,
+            episode_lengths >= min_window_len,
+            (episode_lengths - min_window_len) // self._window_stride + 1,
             0,
         ).astype(np.int64)
         self._cum_n_starts = np.concatenate([[0], np.cumsum(n_starts)]).astype(np.int64)
@@ -526,7 +499,7 @@ class LeRobotV3Reader(BaseDataset):
         """Apply a root-mode water-fill allocation to an initialized leaf.
 
         Multi-bucket construction deliberately initializes leaves uncapped so
-        their split/exclusion/trim filters and data-contract checks run against
+        their split/exclusion filters and data-contract checks run against
         the complete population.  It then calls this method once with the
         effective-hours allocation.  Prompt tables, normalization stats and
         static action masks do not depend on the selected episode subset; only
@@ -538,7 +511,7 @@ class LeRobotV3Reader(BaseDataset):
 
     @property
     def effective_hours(self) -> float:
-        """Post-split/exclusion/trim footage represented by this leaf."""
+        """Sampleable post-split/exclusion footage represented by this leaf."""
         frames = self._sampleable_episode_frames(self._eps_df)
         return float(frames.sum()) / self._fps / 3600.0
 
@@ -547,9 +520,8 @@ class LeRobotV3Reader(BaseDataset):
     def _resolve_cameras(self, info: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Resolve (head, left_wrist, right_wrist) camera keys.
 
-        Default: a single ``target_camera`` if set (EgoDex-style), else the
-        class-level ``HEAD_CAMERA`` / ``LEFT_WRIST_CAMERA`` / ``RIGHT_WRIST_CAMERA``
-        (OXE-style). RoboCOIN overrides to resolve by info.features priority.
+        Use ``target_camera`` if set, otherwise the class-level camera keys.
+        RoboCOIN overrides this to resolve cameras by info.features priority.
         """
         if self._target_camera is not None:
             return (self._target_camera, None, None)
@@ -597,46 +569,8 @@ class LeRobotV3Reader(BaseDataset):
         """Min episode length to yield a train window. 1 = any single labeled step."""
         return 1
 
-    def _filter_episodes(self, eps_df: pd.DataFrame) -> pd.DataFrame:
-        """Optional hook to drop episodes after split / excluded_episodes filtering.
-
-        Default: identity (no filtering). Called in ``__init__`` right after the
-        ``meta/excluded_episodes.json`` blacklist is applied and before the
-        offset arrays / window index are built, so a subclass can remove
-        episodes on a data-quality criterion computed from ``eps_df`` columns
-        (e.g. Ego4D drops rows whose bilingual ``tasks`` string has no usable
-        English half). Implementations MUST ``reset_index(drop=True)`` on the
-        returned frame. The per-row ``_data_row_offset`` / ``_video_frame_offset``
-        columns are preserved across row filtering, so alignment stays correct.
-
-        An implementation may additionally return two optional columns to trim
-        each episode instead of dropping it whole:
-
-        ``_valid_start`` / ``_valid_end``
-            Half-open ``[start, end)`` row range of the episode that may be
-            sampled. Absent → ``[0, length)`` (the whole episode).
-            ``__init__`` builds the window index from ``end - start`` and
-            ``_getitem_impl`` offsets BOTH the parquet slice and the video decode
-            by ``start``, so the two stay aligned and no window can reach a
-            trimmed row or frame. AgiBotWorld uses this for the segment-boundary
-            cleanup (see :meth:`~openwam.dataloader.agibotworld.AgiBotWorldDataset._filter_episodes`).
-
-        Contract: emit them as a PAIR, with ``0 <= start < end <= length``. They
-        are consumed as given — an out-of-range value would silently read into
-        the neighbouring episode, since LeRobot v3 packs many episodes per
-        parquet shard and per mp4. Drop the episode rather than returning an
-        empty or inverted range.
-        """
-        return eps_df
-
     def _load_prompts(self) -> None:
-        """Populate the prompt lookup according to ``PROMPT_SOURCE``."""
-        if self.PROMPT_SOURCE == "episode_annotated":
-            self._episode_idx_to_text = load_tasks_annotated(
-                self._dataset_dir, source_name=f"{self.DATASET_NAME}({self._dataset_id})"
-            )
-            return
-        # "task_index": meta/tasks.parquet, index=text, "task_index" column=int.
+        """Populate the task-index lookup from ``meta/tasks.parquet``."""
         tasks_path = self._dataset_dir / "meta" / "tasks.parquet"
         if not self.PROMPT_FILE_REQUIRED and not tasks_path.exists():
             self._task_idx_to_text: Dict[int, str] = {}
@@ -647,13 +581,11 @@ class LeRobotV3Reader(BaseDataset):
         self._task_idx_to_text = dict(zip(task_idx.tolist(), task_str.tolist()))
 
     def _resolve_prompt(self, row, win: pd.DataFrame) -> str:
-        """Resolve this window's prompt text according to ``PROMPT_SOURCE``.
+        """Resolve this window's prompt text through its ``task_index``.
 
         Raises on a missing entry / empty string (a data bug should not slip
         into training as a fabricated prompt).
         """
-        if self.PROMPT_SOURCE == "episode_annotated":
-            return resolve_prompt_by_episode(self._episode_idx_to_text, int(row["episode_index"]), self.DATASET_NAME)
         task_idx = int(win["task_index"].iloc[0])
         if task_idx not in self._task_idx_to_text:
             raise KeyError(
@@ -682,7 +614,7 @@ class LeRobotV3Reader(BaseDataset):
         if not stats_path.exists():
             raise FileNotFoundError(
                 f"normalize_mode={self._normalize_mode!r} but {stats_path} is missing. "
-                f"Run the matching compute_stats script for {self.DATASET_NAME}, or set normalize_mode=null."
+                "Provide the dataset's precomputed statistics, or set normalize_mode=null."
             )
         if stats_path.suffix == ".npy":
             raw = np.load(stats_path, allow_pickle=True).item()
@@ -815,8 +747,36 @@ class LeRobotV3Reader(BaseDataset):
         for cam in self._video_cameras():
             chunk_col = f"videos/{cam}/chunk_index"
             file_col = f"videos/{cam}/file_index"
-            if chunk_col in eps.columns and file_col in eps.columns:
+            if chunk_col not in eps.columns or file_col not in eps.columns:
+                continue
+            timestamp_col = f"videos/{cam}/from_timestamp"
+            if timestamp_col not in eps.columns:
+                # Legacy benchmark manifests omit timestamps and pack episodes
+                # contiguously within each video shard.
                 eps[self._video_offset_col(cam)] = compute_file_local_offsets(eps, chunk_col, file_col)
+                continue
+            timestamps = eps[timestamp_col].to_numpy(dtype=np.float64)
+            frame_offsets = timestamps * self._fps
+            if np.any(~np.isfinite(frame_offsets) | (frame_offsets < 0) | (frame_offsets > 2**53)):
+                raise ValueError(
+                    f"{self.DATASET_NAME}({self._dataset_id}): camera {cam!r} has invalid from_timestamp values"
+                )
+            # Allow floating-point timestamp noise, but never silently move an
+            # episode to a different physical video frame.
+            if np.any(np.abs(frame_offsets - np.rint(frame_offsets)) > 0.25):
+                raise ValueError(
+                    f"{self.DATASET_NAME}({self._dataset_id}): camera {cam!r} timestamps "
+                    f"are not on frame boundaries at fps={self._fps}"
+                )
+            end_col = f"videos/{cam}/to_timestamp"
+            if end_col in eps.columns:
+                spans = (eps[end_col].to_numpy(dtype=np.float64) - timestamps) * self._fps
+                if np.any(~np.isfinite(spans) | (np.abs(spans - eps["length"].to_numpy()) > 0.5)):
+                    raise ValueError(
+                        f"{self.DATASET_NAME}({self._dataset_id}): camera {cam!r} from/to_timestamp "
+                        "span does not match the declared episode length"
+                    )
+            eps[self._video_offset_col(cam)] = np.rint(frame_offsets).astype(np.int64)
 
     @staticmethod
     def _video_offset_col(camera: str) -> str:
@@ -857,11 +817,9 @@ class LeRobotV3Reader(BaseDataset):
 
     def _getitem_impl(self, idx: int) -> dict:
         ep_local = int(np.searchsorted(self._cum_n_starts, idx, side="right") - 1)
-        valid_start = int(self._ep_valid_start[ep_local])
-        valid_end = int(self._ep_valid_end[ep_local])
-        offset = valid_start + (idx - int(self._cum_n_starts[ep_local])) * self._window_stride
+        offset = (idx - int(self._cum_n_starts[ep_local])) * self._window_stride
         row = self._eps_df.iloc[ep_local]
-        actual_raw_len = min(self._num_frames, valid_end - offset)
+        actual_raw_len = min(self._num_frames, int(row["length"]) - offset)
 
         # 1) parquet window rows
         local_start = int(self._ep_data_row_offset[ep_local]) + offset
@@ -1204,6 +1162,7 @@ class LeRobotV3Reader(BaseDataset):
         logger.info("%s.from_config: root mode, %d buckets under %s", cls.__name__, len(sub_dirs), root)
         base_seed = int(_get(config, "seed", 42))
         total_hours = _get(config, "total_hours")
+        common["stats_root"] = str(root)
         return build_multibucket(
             cls,
             sub_dirs,
@@ -1212,6 +1171,7 @@ class LeRobotV3Reader(BaseDataset):
             total_hours=total_hours,
             wrapper_cls=wrapper,
             source_name=cls.__name__,
+            strict=cls.STRICT_BUCKET_LOADING,
         )
 
 

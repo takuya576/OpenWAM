@@ -36,7 +36,7 @@ from openwam.dataloader.robocasa_gr1 import (
 )
 from openwam.dataloader.utils.gr1_kinematics import HAND_DIMS_EEF33, ROT6D_DIMS_EEF33
 from openwam.dataloader.utils.normalization import pin_rot6d_identity
-from openwam.dataloader.utils.stats_computation.robocoin_stats_computation import Accumulator
+from openwam.dataloader.utils.stats_computation.accumulator import Accumulator
 
 
 def _iter_buckets(dataset) -> Iterable[RoboCasaGR1Dataset]:
