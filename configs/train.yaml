@@ -48,10 +48,6 @@ training:
                                          # Requires OPENWAM_TEXT_CACHE=1 (enabled by presets/fast.env), independent of GC
   initialize_model_on_cpu: false         # Load model on CPU, let DeepSpeed move to GPU
   offload_optimizer_device: none         # DeepSpeed ZeRO optimizer-state offload: none / cpu
-  text_embedding_cache: false            # Memoize per-prompt text embeddings (frozen encoder => same values); skips
-                                         # the per-step umT5 forward (~1/4 of a Wan2.2-5B step). Wan backbones only
-  text_encoder_offload: false            # Keep the frozen text encoder on CPU (needs text_embedding_cache; only
-                                         # cache misses run there): frees ~11 GB/GPU for Wan2.2-5B
 
   # --- LoRA (parameter-efficient fine-tuning; see openwam/model/lora.py) ---
   # Adapters W + (alpha/rank)·B·A on every nn.Linear under `targets` (pretrained W frozen), the `full_train`

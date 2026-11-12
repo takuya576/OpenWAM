@@ -234,12 +234,11 @@ Set `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, and `MASTER_ADDR` for multi-node la
 
 ### LoRA fine-tuning on 46 GB GPUs
 
-Fine-tuning OpenWAM-α in full trains ~6B parameters and needs 80 GB GPUs under ZeRO-2. `training.lora` trains low-rank adapters on the `nn.Linear` layers of the video DiT instead, while the action expert, the proprio encoder and the DiT's head and patch embedding (plus its biases, norms and AdaLN modulation) still train in full. With the prompt-embedding cache and the frozen text encoder kept on CPU, a 4-GPU run at 8 samples per GPU peaks at about 28 GB per GPU (L40S).
+Fine-tuning OpenWAM-α in full trains ~6B parameters and needs 80 GB GPUs under ZeRO-2. `training.lora` trains low-rank adapters on the `nn.Linear` layers of the video DiT instead, while the action expert, the proprio encoder and the DiT's head and patch embedding (plus its biases, norms and AdaLN modulation) still train in full. With the text-embedding cache (`OPENWAM_TEXT_CACHE=1`, on by default through `presets/fast.env`) and the frozen text encoder offloaded to host memory between cache misses, a 4-GPU run at 8 samples per GPU peaks at about 28 GB per GPU (L40S).
 
 ~~~yaml
 training:
-  text_embedding_cache: true      # memoize prompt embeddings; skips the per-step umT5 forward
-  text_encoder_offload: true      # keep the frozen text encoder on CPU (requires the cache)
+  text_encoder_offload: true      # frozen umT5 weights in pinned host memory between cache misses (needs OPENWAM_TEXT_CACHE=1)
   lora:
     enabled: true
     rank: 128

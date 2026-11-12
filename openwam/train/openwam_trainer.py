@@ -178,21 +178,6 @@ class OpenWAMTrainer:
             if is_main:
                 print(report.summary(), flush=True)
 
-        # --- Text-encoder cost: memoize per-prompt embeddings (the encoder is
-        # frozen, so a prompt's embedding never changes) and optionally keep the
-        # encoder on CPU. Offloading needs the cache, or every step would run it there.
-        self._text_cache = bool(t.get("text_embedding_cache", False))
-        self._text_encoder_offload = bool(t.get("text_encoder_offload", False))
-        if self._text_encoder_offload and not self._text_cache:
-            raise ValueError("training.text_encoder_offload=true requires training.text_embedding_cache=true.")
-        if self._text_cache:
-            vb = self.architecture.video_backbone
-            if not hasattr(vb, "enable_train_text_cache"):
-                raise ValueError(
-                    f"training.text_embedding_cache is not supported by video backbone {type(vb).__name__}."
-                )
-            vb.enable_train_text_cache(offload_encoder=self._text_encoder_offload)
-
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
 
@@ -583,11 +568,6 @@ class OpenWAMTrainer:
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
         arch.set_dtype_device(arch.dtype, self.accelerator.device)
         arch.move_frozen_to_device(self.accelerator.device)
-        if getattr(self, "_text_encoder_offload", False):
-            # Last device move of the run, so the encoder stays on CPU from here on;
-            # cached prompts never touch it again and misses are encoded there.
-            arch.video_backbone.apply_text_encoder_offload()
-            logger.info("Text encoder offloaded to CPU (text_embedding_cache serves the training prompts).")
         logger.info(
             "architecture wrapped (%s), device=%s",
             type(self.architecture).__name__,
