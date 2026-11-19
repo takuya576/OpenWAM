@@ -7,6 +7,9 @@ Three processes::
     raiden rd serve         robot host              rd serve --action-type joint --control-hz 30 ...
     this client             raiden's venv           python scripts/run_yam_policy.py --robot-uri ... --prompt ...
 
+When the robot host has the GPU, scripts/deploy_local.sh runs the policy server and
+this client there, with both URIs on loopback.
+
 Every chunk, the client sends the newest observation (three camera frames, the
 measured 14-D joints and the prompt) as one ``chunk`` request and gets the whole
 generated chunk back: absolute joints ``[left q6, left grip, right q6, right grip]``

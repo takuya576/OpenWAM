@@ -708,6 +708,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if state_dict is None:
             state_dict = self.state_dict()
         state_dict = _exclude_vlm_from_state_dict(state_dict)
+        # The GAE alignment projector is training-only and stays out of the deploy
+        # checkpoint; save_weights writes it to its own file (openwam/model/gae_align.py).
+        from openwam.model.gae_align import exclude_gae_from_state_dict
+
+        state_dict = exclude_gae_from_state_dict(state_dict)
+        from openwam.model.rgf_align import exclude_rgf_from_state_dict
+
+        state_dict = exclude_rgf_from_state_dict(state_dict)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         save_file(state_dict, path)
 
@@ -1092,6 +1100,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
             ]
             inputs["video_is_pad"] = _h2d(torch.stack(latent_masks, dim=0), _device)
 
+        # GAE alignment targets (training.gae_align): present only when the dataset was
+        # built with ``gae_cache_dir``. Loss-side only, popped before the forward pass.
+        gae_targets = [sample.get("gae_target") for sample in samples]
+        if all(g is not None for g in gae_targets):
+            inputs["gae_target"] = _h2d(torch.stack(gae_targets, dim=0), _device)
+            inputs["gae_valid"] = _h2d(torch.stack([sample["gae_valid"] for sample in samples], dim=0), _device)
+        # RGF baseline targets (training.rgf), present only with ``rgf_cache_dir``; loss-side only.
+        if all(sample.get("rgf_grid") is not None for sample in samples):
+            for key in ("rgf_grid", "rgf_grid_valid", "rgf_pool", "rgf_pool_valid"):
+                inputs[key] = _h2d(torch.stack([sample[key] for sample in samples], dim=0), _device)
+
         return inputs
 
     # --- Training: loss computation ---
@@ -1193,6 +1212,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # MoT design, attention itself does not consume sample-level padding.
         forward_inputs.pop("action_is_pad", None)
         forward_inputs.pop("video_is_pad", None)
+        forward_inputs.pop("gae_target", None)
+        forward_inputs.pop("gae_valid", None)
+        for key in ("rgf_grid", "rgf_grid_valid", "rgf_pool", "rgf_pool_valid"):
+            forward_inputs.pop(key, None)
 
         # Route per-sample proprio_mask through pipeline_inputs to
         # ``_append_proprio_context_token``. Internal-only key; pop'd there.
@@ -1221,6 +1244,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
 
         if lambda_action == 0 or action_noise_pred is None:
+            if getattr(self, "_gae_align_cfg", None) is not None:
+                raise NotImplementedError("training.gae_align needs the joint video-action forward (lambda_action > 0)")
+            if getattr(self, "_rgf_cfg", None) is not None:
+                raise NotImplementedError("training.rgf needs the joint video-action forward (lambda_action > 0)")
             return {
                 "loss": lambda_video * loss_video,
                 "loss_video": lambda_video * loss_video.detach(),
@@ -1248,7 +1275,140 @@ class BaseWAMArchitecture(ABC, nn.Module):
             "loss_action": lambda_action * loss_action.detach(),
         }
 
+        # --- GAE alignment loss (training.gae_align; logged unweighted) ---
+        loss_align = self._compute_gae_align_loss(inputs)
+        if loss_align is not None:
+            result["loss"] = loss + self._gae_align_cfg.weight * loss_align
+            result["loss_align"] = loss_align.detach()
+
+        # --- Relational Geometry Forcing baseline (training.rgf; terms logged unweighted) ---
+        rgf = self._compute_rgf_loss(inputs)
+        if rgf is not None:
+            cfg = self._rgf_cfg
+            loss_rgf = cfg.w_intra * rgf["intra"] + cfg.w_cross * rgf["cross"] + cfg.w_temporal * rgf["temporal"]
+            result["loss"] = result["loss"] + cfg.weight * loss_rgf
+            result["loss_rgf"] = loss_rgf.detach()
+            for name, value in rgf.items():
+                result[f"loss_rgf_{name}"] = value.detach()
+
         return result
+
+    # --- GAE alignment (training-only auxiliary loss; docs/gae_alignment.md) ---
+
+    def enable_gae_align(self, cfg) -> None:
+        """Create the training-only projector and switch on hidden-state capture.
+
+        Called by the trainer after the checkpoint is loaded (the projector is not part
+        of any checkpoint) and before LoRA / optimizer / ``accelerator.prepare``.
+        """
+        from openwam.model.gae_align import GAEProjector
+
+        build = getattr(self, "build_mot_driver", None)
+        driver = getattr(self, "_mot_driver", None) or (build() if build is not None else None)
+        if driver is None:
+            raise NotImplementedError(
+                f"training.gae_align is implemented for the joint self-attention block loop only, not {type(self).__name__}"
+            )
+        if cfg.layer > driver.num_layers:
+            raise ValueError(f"training.gae_align.layer={cfg.layer} but the DiT has {driver.num_layers} blocks")
+        self.gae_projector = GAEProjector(
+            in_dim=int(self.video_backbone.dim),
+            hidden_dim=cfg.hidden_dim,
+            channels=cfg.channels,
+            frames_per_latent=int(self.video_backbone.temporal_compression),
+        ).to(device=self.device, dtype=self.dtype)
+        driver.capture_layers = (int(cfg.layer),)
+        self._gae_align_cfg = cfg
+
+    def _compute_gae_align_loss(self, inputs):
+        """Alignment loss of the last forward pass, or None when the feature is off / the batch has no targets."""
+        cfg = getattr(self, "_gae_align_cfg", None)
+        target = inputs.get("gae_target")
+        if cfg is None or target is None:
+            return None
+        from openwam.model.gae_align import gae_align_loss
+
+        hidden = getattr(self._mot_driver, "captured", {}).get(cfg.layer)
+        if hidden is None:
+            raise RuntimeError(f"gae_align: hidden states after block {cfg.layer} were not captured")
+        proj = self.gae_projector
+        gh, gw = proj.grid
+        b = hidden.shape[0]
+        tokens = hidden.reshape(b, -1, gh, gw, hidden.shape[-1])
+        # Latent frame 0 is the clean first frame; only the future latent frames are aligned.
+        n_future = target.shape[1] // proj.frames_per_latent
+        if n_future < 1 or n_future * proj.frames_per_latent != target.shape[1] or tokens.shape[1] <= n_future:
+            raise RuntimeError(
+                f"gae_align: {tokens.shape[1]} latent frames vs {target.shape[1]} target frames "
+                f"({proj.frames_per_latent} video frames per latent frame)"
+            )
+        pred = proj(tokens[:, -n_future:].to(proj.inp.weight.dtype))
+        return gae_align_loss(pred, target, inputs.get("gae_valid"), cfg.loss)
+
+    # --- Relational Geometry Forcing baseline (training-only auxiliary loss; docs/rgf_baseline.md) ---
+
+    def enable_rgf(self, cfg) -> None:
+        """Create the training-only projection heads g_vid / g_act and switch on hidden-state capture.
+
+        Same placement as :meth:`enable_gae_align`: after the checkpoint load, before LoRA /
+        optimizer / ``accelerator.prepare``.
+        """
+        from openwam.model.rgf_align import RGFProjector
+
+        if getattr(self, "_gae_align_cfg", None) is not None:
+            raise ValueError("training.rgf and training.gae_align cannot be enabled together")
+        build = getattr(self, "build_mot_driver", None)
+        driver = getattr(self, "_mot_driver", None) or (build() if build is not None else None)
+        if driver is None:
+            raise NotImplementedError(
+                f"training.rgf is implemented for the joint self-attention block loop only, not {type(self).__name__}"
+            )
+        if cfg.layer > driver.num_layers:
+            raise ValueError(f"training.rgf.layer={cfg.layer} but the experts have {driver.num_layers} blocks")
+        self.rgf_projector = RGFProjector(
+            video_dim=int(self.video_backbone.dim),
+            action_dim=int(driver.ab.dim),
+            hidden_dim=cfg.hidden_dim,
+            proj_dim=cfg.proj_dim,
+        ).to(device=self.device, dtype=self.dtype)
+        driver.capture_layers = (int(cfg.layer),)
+        self._rgf_cfg = cfg
+
+    def _compute_rgf_loss(self, inputs):
+        """The three RGF terms of the last forward pass, or None when the feature is off / no targets."""
+        cfg = getattr(self, "_rgf_cfg", None)
+        grid = inputs.get("rgf_grid")
+        if cfg is None or grid is None:
+            return None
+        from openwam.model.rgf_align import YAM_GRID, rgf_loss, view_token_indices
+
+        driver = self._mot_driver
+        video = getattr(driver, "captured", {}).get(cfg.layer)
+        action = getattr(driver, "captured_action", {}).get(cfg.layer)
+        if video is None or action is None:
+            raise RuntimeError(f"rgf: hidden states after block {cfg.layer} were not captured")
+        b, n_tok = grid.shape[0], grid.shape[2]
+        if n_tok != YAM_GRID[0] * YAM_GRID[1] or video.shape[1] != grid.shape[1] * n_tok:
+            raise RuntimeError(
+                f"rgf: {video.shape[1]} video tokens vs {grid.shape[1]} latent frames x {n_tok} target tokens"
+            )
+        pool = inputs["rgf_pool"]
+        if action.shape[1] != pool.shape[1]:
+            raise RuntimeError(f"rgf: {action.shape[1]} action tokens vs {pool.shape[1]} scene vectors")
+        heads = self.rgf_projector
+        dt = heads.video[0].weight.dtype
+        zv = heads.video(video.to(dt)).reshape(b, grid.shape[1], n_tok, -1)
+        za = heads.action(action.to(dt))
+        return rgf_loss(
+            zv,
+            grid,
+            inputs.get("rgf_grid_valid"),
+            za,
+            pool,
+            inputs.get("rgf_pool_valid"),
+            view_token_indices(),
+            beta=cfg.huber_beta,
+        )
 
     def _compute_video_loss(self, noise_pred, target, timestep_ids, inputs, device):
         """Per-sample weighted video MSE loss."""

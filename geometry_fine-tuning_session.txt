@@ -1,0 +1,1639 @@
+
+❯ Referring to /home/takuya/GAE-GeometricAutoEncoder, consider how to integrate
+  geometry info into openwam base model fine-tuning.
+  I'd like to improve the model's performance better than the original openwam
+  in real world tasks, and it'll be more sensitive to boarder between objects
+  and background with geometry infomation.
+  Just think about the plan.
+
+● I'll start by reading both codebases to understand what GAE provides and how
+  OpenWAM's backbone consumes inputs.
+
+  Listed 1 directory, ran 11 shell commands (ctrl+o to expand)
+
+● GAE's design is a frozen DA3-Giant encoder feeding a 64-channel codec latent,
+  with an RGB head and a frozen DPT depth/ray head. I'm now reading OpenWAM's
+  Wan backbone, trainer, LoRA and YAM dataloader to find where geometry can plug
+  in. · summary
+
+  Listed 1 directory, ran 9 shell commands (ctrl+o to expand)
+
+● Still reading Wan2.2's token grid, 32 px per DiT token on the 384×320 canvas.
+  Next I'm checking the training loss, the video–action joint attention, and the
+  deploy path. · summary
+
+  Searched for 2 patterns, listed 1 directory, ran 6 shell commands (ctrl+o to expand)
+
+● I'm checking the camera canvas (the 640×480 views are stretched into a 384×320
+  L-shape) and the trainer's optimizer and LoRA hooks to see where a geometry
+  loss can attach without breaking the merged-checkpoint deploy path. · summary
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Now checking how the trainer wraps modules and saves checkpoints, since an
+  auxiliary geometry head must not leak into the deploy checkpoint.
+
+  Searched for 2 patterns, listed 1 directory, ran 4 shell commands (ctrl+o to expand)
+
+● I have what I need; grabbing a few exact line numbers for the hook points,
+  then I'll write up the plan.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● I'd use GAE as a frozen geometry teacher during training, not as a replacement
+  for OpenWAM's latent space. The plan: precompute GAE latents for every YAM
+  frame offline, then add a training-only loss that makes the Wan DiT's video
+  tokens predict them. This adds nothing at deploy time and keeps the checkpoint
+  format. Feeding geometry in as an extra input is a stronger but costlier
+  second step, because it needs DA3-Giant running in the policy loop.
+
+  What shapes the design
+
+  - Token grid is the boundary bottleneck. The DiT sees the 384×320 (H×W) canvas
+    at 32×32 px per token. That is 12×10 tokens per latent frame and 3 latent
+    frames, where frame 0 is the clean current observation. The head camera gets
+    8×10 tokens and each wrist camera 4×5. So geometry has to be supervised
+    below token resolution, or it won't sharpen boundaries.
+  - The action expert reads video tokens at all 30 layers through joint
+    attention. Geometry-aware video tokens therefore reach the action without
+    changing the action expert.
+  - GAE's latent is more than depth. It has 64 channels per 14-px patch, can be
+    decoded to depth and rays by the frozen DA3 head, and is aligned to
+    C-RADIO/DINOv2 features. So it also captures which pixels belong to the same
+    object. That matters where the depth edge is weak, like a cube sitting on a
+    table.
+  - Ruled out:
+    - Replacing the Wan VAE with GAE through OpenWAM's external-encoder path
+      needs from_scratch=true, which throws away the foundation DiT. That isn't
+      viable with about 50 demos.
+    - GAE's flow model generates whole scenes from camera paths, so it doesn't
+      apply here; only the codec is useful.
+  - Deploy loads checkpoints strictly (base.py:679
+    (openwam/model/architectures/base.py#L679)). Training-only modules must be
+    stripped at save time, the way LoRA keys are in checkpointing.py:195
+    (openwam/train/utils/checkpointing.py#L195).
+  - Separate environments. GAE runs in the gae env (torch 2.5.1) and OpenWAM in
+    openwam (torch 2.7.1). An offline cache keeps them apart for training.
+
+  Options
+
+  ┌──────────────────────────┬─────────────────┬───────────────┬────────────┐
+  │                          │                 │    Keeps      │            │
+  │          Option          │   Deploy cost   │  foundation   │  Verdict   │
+  │                          │                 │      DiT      │            │
+  ├──────────────────────────┼─────────────────┼───────────────┼────────────┤
+  │ GAE latent replaces Wan  │ DA3 every step  │ No            │ Reject     │
+  │ VAE latent               │                 │               │            │
+  ├──────────────────────────┼─────────────────┼───────────────┼────────────┤
+  │ Training-only alignment  │ None            │ Yes           │ Main path  │
+  │ of video tokens to GAE   │                 │               │            │
+  ├──────────────────────────┼─────────────────┼───────────────┼────────────┤
+  │ Video loss weighted      │ None            │ Yes           │ Cheap      │
+  │ toward depth edges       │                 │               │ extra arm  │
+  ├──────────────────────────┼─────────────────┼───────────────┼────────────┤
+  │ Frame-0 GAE latent as a  │ DA3-Giant +     │ Yes           │ Phase 3,   │
+  │ zero-init input          │ codec per chunk │               │ if needed  │
+  ├──────────────────────────┼─────────────────┼───────────────┼────────────┤
+  │ Predict future RGB and   │ Same as above   │ Yes           │ Later      │
+  │ geometry together        │                 │               │            │
+  └──────────────────────────┴─────────────────┴───────────────┴────────────┘
+
+  Phase 0: feasibility gate
+
+  1. Does GAE work on robot views? Run GAE reconstruction on YAM head and wrist
+     frames from all three tasks. Compare GAE-decoded depth with raw DA3 depth
+     at the cube, ring, peg and bottle edges. Also compare single-frame encoding
+     with 17-frame-clip encoding, since the codec was trained on clips. If the
+     64-channel bottleneck blurs the ring or peg, use DA3 depth or PCA-reduced
+     DA3 features as the target instead.
+  2. Measure the baseline's boundary sensitivity. Freeze your best LoRA
+     checkpoint. Train a linear probe from frame-0 tokens at layers {5, 10, 15,
+     20, 25} to a depth-edge map, and report edge F1 on held-out episodes. That
+     gives a number to beat and shows which layers lack geometry.
+
+  Phase 1: offline geometry cache
+
+  - Build script (in the gae env):
+    - Resize each 480×640 frame to 378×504 (27×36 patches) and run DA3-Giant
+      plus the codec encoder.
+    - Standardize the result with latent_stats_gae_64.pt.
+    - Resample each camera into its canvas slot at 16 px, stretched the same way
+      the RGB is. Each frame becomes 64×24×20, exactly the Wan VAE latent grid.
+    - Also store a depth-edge map and an object-edge map (cosine distance
+      between neighbouring GAE cells) at the same grid.
+  - Size: about 60 KB per frame in fp16, roughly 1 GB per task. Reserve the disk
+    space first.
+  - Dataloader: return the maps for the same frame indices as the video and mask
+    padded frames. Targets come from frames without colour jitter, so
+    ColorJitter stays as it is.
+
+  Phase 2: geometry alignment loss (main experiment)
+
+  This is the same idea as Geometry Forcing (for video diffusion models) and
+  Spatial Forcing (for VLAs), both of which aligned to VGGT features; here the
+  target is GAE.
+  - Hidden states: capture video-token hidden states at one layer ℓ inside the
+    joint loop (mot_driver.py:306
+    (openwam/model/architectures/dual_system/mot_driver.py#L306)).
+  - Projector: an MLP 3072 → 2048 → 64 × (2×2 sub-cells) × (frames per latent
+    frame: 1 for frame 0, 4 for frames 1–2). The 2×2 sub-cell output is what
+    makes each 32-px token encode where a boundary crosses it.
+  - Loss terms:
+    - Per-cell cosine plus a small L2 term. The L2 keeps predictions decodable
+      through GAE and the DPT head, so you can view the depth the model sees and
+      imagines.
+    - A relation loss that matches cell-to-cell similarity within each camera.
+      This is GAE's own structure loss and directly encodes "same object or
+      not".
+    - Cells weighted by 1 + β·edge.
+    - Future frames weighted by (1−σ), because geometry at high noise is a
+      guess.
+  - Projector handling: it trains as part of the architecture but is stripped
+    from the saved checkpoint, so deploy and open-loop eval are unchanged. It is
+    saved separately for diagnostics.
+  - Arms on place_cube_right n56 delta LoRA (baseline best held-out MAE is
+    0.0509 at step 3072):
+    - G1: frame 0 only, ℓ=10, λ=0.5.
+    - G2: all frames plus the relation loss, ℓ=10, λ=0.5.
+    - G3: G2 with ℓ=20.
+    - G4: G2 plus edge weighting on both the alignment loss and the video
+      flow-matching loss.
+    - Baseline, second seed: to know the noise floor.
+  - Cost: about 5 runs × 3–4 h on 4×L40S.
+  - Follow-up: run the winner on hang_ring next (thin ring and peg, the task
+    most limited by boundaries), then on stand_up_bottle.
+
+  Phase 3: explicit geometry input (only if Phase 2 isn't enough)
+
+  - Adapter: a zero-init Conv(64→3072, kernel 2, stride 2) on the frame-0 GAE
+    map, added to the frame-0 tokens right after patchify (wan_backbone.py:421
+    (openwam/model/video_backbone/wan_backbone.py#L421)). This mirrors Wan's
+    existing control_adapter hook.
+  - Geometry dropout: about 0.15, so the RGB path stays strong.
+  - Deploy:
+    - DA3-Giant plus the codec encoder run on the 3 live images every chunk. My
+      rough estimate is about 6–7 TFLOP, on the order of 0.1 s on an L40S-class
+      GPU; this needs measuring.
+    - The GAE code has to run next to the server. Either install its
+      dependencies in the openwam env (the torch 2.7.1 vs 2.5.1 difference must
+      be checked) or run it as a side process in the gae env.
+    - The adapter is saved in the checkpoint and built from config at deploy.
+  - If this helps: the next step is to add GAE channels as zero-init extra
+    input/output channels of patch_embedding and head. Your LoRA recipe already
+    trains both in full. The model would then predict future geometry together
+    with RGB.
+
+  Evaluation
+
+  - Primary offline metric: held-out open-loop MAE at each arm's best
+    checkpoint, not training loss. Split it by phase (approach, contact,
+    transport) using gripper events; geometry should help most near contact.
+  - Boundary metrics: the Phase 0 probe F1, plus DA3 run on generated vs
+    recorded frames in open_loop_eval (depth AbsRel and depth-edge F1).
+  - Real robot: at least 20 trials per arm per task, on a fixed list of object
+    placements, alternating arms. Record why each failure happened, e.g.
+    misjudged edge vs. something else. Twenty trials only show large
+    differences, roughly 50% → 80%.
+  - Adoption rule: better held-out MAE on at least 2 of 3 tasks, and no worse on
+    the robot.
+
+  Risks
+
+  - Domain gap: GAE was trained on scene videos, not close-range wrist views.
+    Phase 0 decides whether it transfers.
+  - Resolution ceiling: the 32-px token limits boundary precision. If Phase 2
+    helps but plateaus, a larger canvas is the next step, but it is expensive
+    because it changes the foundation model's training resolution.
+  - Small data: with about 50 episodes the extra loss also acts as a regularizer
+    and may slow action-loss fitting. Watch both curves; the λ values in the
+    sweep cover this.
+  - Licensing: DA3-Giant is CC BY-NC 4.0 and GAE has its own Tencent license.
+    That's fine for research; check before any commercial use.
+
+  I'd start with Phase 0 (GAE reconstruction on YAM frames plus the baseline
+  probe); say the word and I'll set it up.
+
+❯ Start with Phase 0.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Phase 0 splits into GAE reconstruction on YAM frames versus raw DA3, and a
+  linear probe of the baseline's frame-0 tokens for depth edges, with disk tight
+  so I'll keep outputs small. Next I'm reading GAE's reconstruction-eval code
+  to reuse its raw-DA3 versus codec decode path. · summary
+
+  Ran 5 shell commands (ctrl+o to expand)
+
+● The gae environment has PyAV, OpenCV and depth-anything-3, so GAE runs there
+  while the probe goes in openwam. I'm checking the YAM reader's sample-to-frame
+  mapping next so both sides match. · summary
+
+  Searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+● Window indexes map straight to (episode, start frame), so I'll fix the probe
+  frames once and reuse them on both sides. Next I'm checking how deploy loads a
+  checkpoint, so the probe runs on the exact trained model. · summary
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The deploy loader gives me the exact trained model. Checking which checkpoints
+  have held-out results (to pick the probe checkpoint), the foundation model's
+  config, and free RAM.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The best held-out checkpoints are place_cube_right at step 3072 and hang_ring
+  at step 5120, both with right-joint MAE 0.0509. I'm probing those two plus the
+  foundation model, and next I'm reading the joint loop to place the
+  hidden-state hooks. · summary
+
+  Searched for 1 pattern, ran 3 shell commands (ctrl+o to expand)
+
+● The engine path is clear, so I'm running architecture.generate with the deploy
+  schedule cut to its first step and hooking the joint loop. Next I'm checking
+  where the gae env finds its model weights in the HF cache. · summary
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The gae env sets HF_HOME on activation, so the released weights should load.
+  Next I'm checking how OpenWAM decodes video frames so my DA3 inputs index them
+  the same way. · summary
+
+  Searched for 3 patterns (ctrl+o to expand)
+
+● I'm writing the GAE-side helpers first, covering frame decoding, encoding,
+  depth comparison, edge maps, and camera slot mapping. · summary
+
+● Write(scripts/geometry/gae_tools.py)
+  ⎿  Wrote 284 lines to scripts/geometry/gae_tools.py
+       1 """GAE / Depth Anything 3 helpers for OpenWAM geometry experimen
+         ts.
+       2
+       3 Runs in the ``gae`` conda env (torch 2.5.1, depth-anything-3), n
+         ot in ``openwam``.
+       4 Everything here reads YAM LeRobot v2.1 episodes directly and ret
+         urns numpy /
+       5 torch arrays; nothing imports openwam, so the two environments n
+         ever mix.
+       6
+     … +278 lines (ctrl+o to expand)
+
+● Quick smoke test on GPU 4: one frame per camera from a held-out
+  place_cube_right episode, checking shapes, timing and the log-depth-gradient
+  distribution before fixing the edge threshold.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The pipeline handles 3 robot-frame images in about 1 s at 8.7 GB peak, with
+  depth within about 1% AbsRel and RGB at 33–38 dB PSNR. I'm confirming an edge
+  threshold near 0.03 visually next, then checking the stand_up_bottle split
+  before writing Part A. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+● Write(scripts/geometry/phase0_gae_recon.py)
+  ⎿  Wrote 208 lines to scripts/geometry/phase0_gae_recon.py
+      1 #!/usr/bin/env python3
+      2 """Phase 0A: does GAE's 64-channel latent keep the geometry of YA
+        M robot views?
+      3
+      4 For held-out episodes of one task, each camera frame is encoded t
+        wo ways and
+      5 decoded back to depth through the frozen DA3 DPT head:
+      6
+      7 * single : the frame alone (a one-view DA3 set) — what a policy c
+        an compute live.
+     … +201 lines (ctrl+o to expand)
+
+● Running Part A on place_cube_right first (4 held-out episodes × 3 clip
+  positions × 3 cameras), then I'll look at the panels to validate the edge
+  threshold before running the other tasks.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● A small bug: the teacher-vs-teacher rows have no RGB PSNR. Fixing the
+  aggregation to skip missing values.
+
+● Update(scripts/geometry/phase0_gae_recon.py)
+  ⎿  Added 2 lines, removed 2 lines
+      177              )
+      178          print(f"[ep {ep}] {len(starts)} clips done ({time.time
+           () - t_start:.0f}s)", flush=True)
+      179
+      180 -    keys = list(records[0].keys())
+      180 +    keys = list(dict.fromkeys(k for r in records for k in r))
+      181      with open(out_dir / "records.csv", "w", newline="") as f:
+      182 -        w = csv.DictWriter(f, fieldnames=keys)
+      182 +        w = csv.DictWriter(f, fieldnames=keys, restval="")
+      183          w.writeheader()
+      184          w.writerows(records)
+      185
+
+● Update(scripts/geometry/phase0_gae_recon.py)
+  ⎿  Added 1 line, removed 1 line
+      196          "panel_columns": ["input", "GAE RGB (single)", "DA3 de
+           pth (single)", "GAE depth (single)",
+      197                            "GAE depth (clip, view 0)", "edges:
+           DA3 green / GAE magenta / both white"],
+      198          "mean": {
+      199 -            f"{m}/{c}": {k: float(np.nanmean([r[k] for r in v]
+          -)) for k in metric_keys}
+      199 +            f"{m}/{c}": {k: float(np.nanmean([r[k] for r in v]
+          +)) for k in metric_keys if k in v[0]}
+      200              for (m, c), v in sorted(groups.items())
+      201          },
+      202      }
+
+● Meanwhile, the panels were already written; let me look at one before
+  re-running.
+
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+
+● The panel checks out, with the depth and edge maps lining up cleanly, but the
+  blue target pad shows no depth edge since it's flat. I'm adding a second probe
+  based on edges in the GAE latent and re-running Part A for all three tasks in
+  the background. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● While Part A runs, I'm writing the probe-target builder, and I'm adding the
+  GAE latent itself as a target, since a linear map's recovery of it from the
+  DiT tokens is the baseline Phase 2 must beat. · summary
+
+● Write(scripts/geometry/phase0_targets.py)
+  ⎿  Wrote 190 lines to scripts/geometry/phase0_targets.py
+       1 #!/usr/bin/env python3
+       2 """Phase 0B (step 1): geometry targets for probing OpenWAM's fra
+         me-0 tokens.
+       3
+       4 Picks window start frames from one YAM task, encodes every camer
+         a frame alone
+       5 with DA3-Giant + GAE (exactly what a policy could compute live),
+          and writes
+       6 the targets in OpenWAM's 384x320 canvas layout so they line up w
+         ith the DiT's
+     … +184 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Launching the target builder on GPU 5 in parallel: place_cube_right (fit 0–47,
+  ridge-selection 48–55, held-out 56–65) and hang_ring (fit 0–42, selection
+  43–49, held-out 50–53).
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● While both GPU jobs run, I'm writing the probe and checking the three details
+  it relies on: the embedding cache type, how the trainer builds datasets, and
+  the train-split window rule. · summary
+
+  Searched for 2 patterns, ran 1 shell command (ctrl+o to expand)
+
+● Both jobs are underway: I'm writing a probe script that loads checkpoints,
+  runs only the first denoising step, hooks frame-0 video tokens, and fits ridge
+  probes from running statistics to avoid a full disk. · summary
+
+● Write(scripts/geometry/phase0_probe.py)
+  ⎿  Wrote 478 lines to scripts/geometry/phase0_probe.py
+       1 #!/usr/bin/env python3
+       2 """Phase 0B (step 2): how much geometry do OpenWAM's frame-0 vid
+         eo tokens carry?
+       3
+       4 For every window start in a targets file from ``phase0_targets.p
+         y``, this runs
+       5 the deploy inference path (``architecture.generate``) for its fi
+         rst denoising
+       6 step only — future video and actions at full noise, the current
+         observation
+     … +472 lines (ctrl+o to expand)
+
+● Before running, I'm adjusting the ridge penalty to the correlation scale with
+  a wider grid, flooring tiny feature variances, and offloading the text encoder
+  once the first prompt is cached so the probe fits alongside other jobs on the
+  46 GB GPU. · summary
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 2 lines, removed 1 line
+      58
+      59  logger = logging.getLogger("phase0_probe")
+      60
+      61 -LAMBDAS = [1e-2, 1e-1, 1.0, 10.0, 100.0, 1e3, 1e4, 1e5]
+      61 +# Ridge penalties added to the eigenvalues of the feature corre
+         +lation matrix.
+      62 +LAMBDAS = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0]
+      63  GROUPS = ("edge", "depth", "gae")
+      64  TOK_H, TOK_W = 12, 10  # frame-0 token grid of the 384x320 canv
+          as
+      65
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 3 lines, removed 2 lines
+      142      n = m.n
+      143      mu = m.sx / n
+      144      cov = m.xx / n - torch.outer(mu, mu)
+      145 -    sd = cov.diagonal().clamp_min(1e-12).sqrt()
+      145 +    sd = cov.diagonal().clamp_min(0).sqrt()
+      146 +    sd = sd.clamp_min(1e-3 * float(sd.median()) + 1e-12)  # ne
+          +ar-constant features stay tame
+      147      zz = cov / torch.outer(sd, sd)  # correlation of standardi
+           zed features
+      148      ymu = m.sy / n
+      149      zy = (m.xy / n - torch.outer(mu, ymu)) / sd[:, None]
+     ...
+      151      proj = evecs.T @ zy
+      152      out = []
+      153      for lam in lambdas:
+      153 -        wz = evecs @ (proj / (evals + lam / n)[:, None])
+      154 +        wz = evecs @ (proj / (evals + lam)[:, None])
+      155          w = wz / sd[:, None]
+      156          b = ymu - mu @ w
+      157          out.append((w, b))
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 3 lines
+      380                      prompt_embed_cache=prompt_cache,
+      381                      proprio=sample["proprio"],
+      382                  )
+      383 +            if getattr(vb, "text_encoder", None) is not None a
+          +nd next(vb.text_encoder.parameters()).is_cuda:
+      384 +                vb.text_encoder.to("cpu")  # the task prompt i
+          +s cached now; frees ~11 GB
+      385 +                torch.cuda.empty_cache()
+      386              ys = target_rows(t, r, args.tau)
+      387              y_all = torch.from_numpy(np.concatenate([ys[g] for
+            g in GROUPS], axis=1))
+      388              gae_x = torch.from_numpy(ys["gae"])
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Removed 3 lines
+      401                  gae_mom[split].add(gae_x.to(device), torch.cat
+           ([torch.from_numpy(ys["edge"]),
+      402
+            torch.from_numpy(ys["depth"])], 1).to(device))
+      403          logger.info("%s: %d frames done (%.0fs)", split, len(r
+           ows), time.time() - t0)
+      404 -        if split_code == 0 and getattr(vb, "text_encoder", Non
+          -e) is not None:
+      405 -            vb.text_encoder.to("cpu")  # the single prompt is
+          -cached; free ~11 GB
+      406 -            torch.cuda.empty_cache()
+      404
+      405      # ── fit, select lambda per target group, evaluate on test
+            ──
+      406      slot = slot_of_token()
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Part A hit a second aggregation bug: frames with no depth edges have no
+  edge-band metric. Checking both logs before fixing.
+
+  Listed 1 directory (ctrl+o to expand)
+
+● Targets are building at ~5 frames/s. Fixing the recon aggregation and
+  re-running Part A for the two remaining tasks on GPU 4 (now free).
+
+● Update(scripts/geometry/phase0_gae_recon.py)
+  ⎿  Added 3 lines, removed 1 line
+      196          "panel_columns": ["input", "GAE RGB (single)", "DA3 de
+           pth (single)", "GAE depth (single)",
+      197                            "GAE depth (clip, view 0)", "edges:
+           DA3 green / GAE magenta / both white"],
+      198          "mean": {
+      199 -            f"{m}/{c}": {k: float(np.nanmean([r[k] for r in v]
+          -)) for k in metric_keys if k in v[0]}
+      199 +            f"{m}/{c}": {
+      200 +                k: float(np.nanmean([r[k] for r in v if k in r
+          +])) for k in metric_keys if any(k in r for r in v)
+      201 +            }
+      202              for (m, c), v in sorted(groups.items())
+      203          },
+      204      }
+
+  Ran 1 shell command (ctrl+o to expand)
+● While those run, I'll smoke-test the probe on GPU 3 (just freed) with a tiny
+  synthetic targets file, to catch loading/hook/indexing bugs before the real
+  run.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The model loads and the first-step schedule checks out, but the job ran out of
+  memory because two other users' jobs landed on GPU 3. I'm shrinking the
+  probe's footprint by keeping accumulators on the GPU only during their split
+  and parking them on CPU otherwise. · summary
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 5 lines
+      126          self.yy = torch.zeros(k, **f64)
+      127          self.n = 0
+      128
+      129 +    def to(self, device) -> "Moments":
+      130 +        for name in ("xx", "xy", "sx", "sy", "yy"):
+      131 +            setattr(self, name, getattr(self, name).to(device)
+          +)
+      132 +        return self
+      133 +
+      134      def add(self, x: torch.Tensor, y: torch.Tensor):
+      135          x = x.to(self.xx)
+      136          y = y.to(self.xx)
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 3 lines, removed 2 lines
+      344      dim = int(vb.dim)
+      345      k_out = {"edge": 16, "depth": 16, "gae": 4 * t["gae"].shap
+           e[1]}
+      346      k_total = sum(k_out.values())
+      347 -    mom = {(s, l): Moments(dim, k_total, device) for s in ("fi
+          -t", "select") for l in layers}
+      348 -    gae_mom = {s: Moments(4 * t["gae"].shape[1], 32, device) f
+          -or s in ("fit", "select")}
+      347 +    # Accumulators sit on the GPU only while their split is be
+          +ing processed.
+      348 +    mom: dict = {}
+      349 +    gae_mom: dict = {}
+      350      test_feats = {l: [] for l in layers}
+      351      test_y = {g: [] for g in GROUPS}
+      352      test_gae_x = []
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 4 lines
+      367              _Subset(ds, [i for _, i in pairs]), batch_size=Non
+           e, shuffle=False,
+      368              num_workers=args.num_workers, persistent_workers=F
+           alse,
+      369          )
+      370 +        if split != "test":
+      371 +            for l in layers:
+      372 +                mom[(split, l)] = Moments(dim, k_total, device
+          +)
+      373 +            gae_mom[split] = Moments(4 * t["gae"].shape[1], 32
+          +, device)
+      374          for (r, _), sample in zip(pairs, loader):
+      375              captured.clear()
+      376              with torch.inference_mode():
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 5 lines
+      410                      mom[(split, l)].add(captured[l], y_all.to(
+           device))
+      411                  gae_mom[split].add(gae_x.to(device), torch.cat
+           ([torch.from_numpy(ys["edge"]),
+      412
+            torch.from_numpy(ys["depth"])], 1).to(device))
+      413 +        if split != "test":
+      414 +            for l in layers:
+      415 +                mom[(split, l)].to("cpu")
+      416 +            gae_mom[split].to("cpu")
+      417 +            torch.cuda.empty_cache()
+      418          logger.info("%s: %d frames done (%.0fs)", split, len(r
+           ows), time.time() - t0)
+      419
+      420      # ── fit, select lambda per target group, evaluate on test
+            ──
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 4 lines, removed 2 lines
+      434      }}
+      435      viz_preds = {}
+      436      for l in layers:
+      437 -        sols = fit_ridge(mom[("fit", l)], LAMBDAS)
+      437 +        m_fit, m_sel = mom[("fit", l)].to(device), mom[("selec
+          +t", l)].to(device)
+      438 +        sols = fit_ridge(m_fit, LAMBDAS)
+      439          chosen = {}
+      440          for g in GROUPS:
+      441              sl = offsets[g]
+      441 -            sse = [float(moments_sse(mom[("select", l)], w[:,
+          -sl], b[sl]).sum()) for w, b in sols]
+      442 +            sse = [float(moments_sse(m_sel, w[:, sl], b[sl]).s
+          +um()) for w, b in sols]
+      443              chosen[g] = int(np.argmin(sse))
+      444 +        m_fit.to("cpu"), m_sel.to("cpu")
+      445          x_test = torch.stack(test_feats[l]).to(device=device,
+           dtype=torch.float64)  # (N, 120, D)
+      446          pred = {}
+      447          for g in GROUPS:
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 1 line
+      457          del x_test
+      458
+      459      # Reference: the GAE latent itself as probe input (edge +
+           depth only).
+      460 +    gae_mom["fit"].to(device), gae_mom["select"].to(device)
+      461      sols = fit_ridge(gae_mom["fit"], LAMBDAS)
+      462      ref_offsets = {"edge": slice(0, 16), "depth": slice(16, 32
+           )}
+      463      x_test = torch.from_numpy(np.stack(test_gae_x)).to(device=
+           device, dtype=torch.float64)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● GPU memory is now heavily contested, with the 11 GB text encoder at the
+  probe's load-time peak. I'm checking how the loader moves modules so the text
+  encoder stays on CPU from the start. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The backbone moves all submodules in one step, so I'm loading on CPU, encoding
+  the task prompt there, and then moving everything except the text encoder to
+  the GPU, which should cut the probe's peak from about 24 GB to 15 GB.
+  · summary
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 8 lines, removed 1 line
+      287              return None
+      288
+      289      model_loader._build_normalizer = _tolerant_build_normalize
+           r
+      290 -    cfg, arch = model_loader.load_from_checkpoint_dir(args.ckp
+          -t_dir, device=str(device), ckpt_name=args.ckpt_name)
+      290 +    # Load on CPU, then move everything except the ~11 GB umT5
+          + text encoder to the
+      291 +    # GPU: the task prompt is encoded once on CPU and served f
+          +rom the deploy-style
+      292 +    # prompt cache, so the probe needs ~15 GB of GPU memory in
+          +stead of ~24 GB.
+      293 +    cfg, arch = model_loader.load_from_checkpoint_dir(args.ckp
+          +t_dir, device="cpu", ckpt_name=args.ckpt_name)
+      294      arch.eval()
+      295 +    text_encoder = arch.video_backbone.text_encoder
+      296 +    text_encoder._apply = lambda fn, recurse=True: text_encode
+          +r  # pin to CPU during the move
+      297 +    arch.set_dtype_device(arch.dtype, device)
+      298 +    del text_encoder._apply
+      299
+      300      deploy_cfg = OmegaConf.load(PROJECT_ROOT / "configs" / "de
+           ploy.yaml")
+      301      denoise_steps = int(args.denoise_steps or deploy_cfg.infer
+           ence.denoise_steps)
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 17 lines
+      359      test_gae_x = []
+      360      test_meta, test_canvases = [], []
+      361      prompt_cache: dict = {}
+      362 +
+      363 +    def ensure_prompt(prompt: str) -> None:
+      364 +        """Encode a prompt on CPU once; generate() then takes
+          +it from the cache."""
+      365 +        if prompt in prompt_cache:
+      366 +            return
+      367 +        from openwam.model.video_backbone.wan import encode as
+          + wan_encode
+      368 +
+      369 +        threads = torch.get_num_threads()
+      370 +        torch.set_num_threads(32)
+      371 +        with torch.inference_mode():
+      372 +            ctx, lens = wan_encode.encode_text(
+      373 +                [prompt], tokenizer=vb._tokenizer, text_encode
+          +r=text_encoder, device=torch.device("cpu")
+      374 +            )
+      375 +        torch.set_num_threads(threads)
+      376 +        prompt_cache[prompt] = (ctx.to(device), lens.to(device
+          +))
+      377 +        logger.info("encoded prompt on CPU: %r", prompt)
+      378 +
+      379      t0 = time.time()
+      380
+      381      for split_code, split in enumerate(split_names):
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 1 line
+      397              gae_mom[split] = Moments(4 * t["gae"].shape[1], 32
+           , device)
+      398          for (r, _), sample in zip(pairs, loader):
+      399              captured.clear()
+      400 +            ensure_prompt(sample["prompt"])
+      401              with torch.inference_mode():
+      402                  arch.generate(
+      403                      first_step,
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Removed 3 lines
+      415                      prompt_embed_cache=prompt_cache,
+      416                      proprio=sample["proprio"],
+      417                  )
+      418 -            if getattr(vb, "text_encoder", None) is not None a
+          -nd next(vb.text_encoder.parameters()).is_cuda:
+      419 -                vb.text_encoder.to("cpu")  # the task prompt i
+          -s cached now; frees ~11 GB
+      420 -                torch.cuda.empty_cache()
+      418              ys = target_rows(t, r, args.tau)
+      419              y_all = torch.from_numpy(np.concatenate([ys[g] for
+            g in GROUPS], axis=1))
+      420              gae_x = torch.from_numpy(ys["gae"])
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● place_cube_right targets are written. Checking a canvas debug image to verify
+  the camera-to-slot mapping and the target layers line up:
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Layout checks out in both views, with the blue pad still missing from depth
+  edges. The small orange cube covers under one DiT token, so I'm checking Part
+  A's completion and then rerunning the probe smoke test. · summary
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Part A is complete for all three tasks. GPU 4 has ~33 GB free (the 12.5 GB
+  there is another user's job), so I'm re-running the probe smoke test there.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Inference works (prompt encoded on CPU, ~1 s per frame including warm-up). One
+  bug: the selection-set error used all 288 outputs instead of each target
+  group's slice. Fixing:
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 4 lines, removed 4 lines
+      163      return out
+      164
+      165
+      166 -def moments_sse(m: Moments, w: torch.Tensor, b: torch.Tensor)
+          --> torch.Tensor:
+      167 -    """Per-output sum of squared errors of x @ w + b on the da
+          -ta summarized by ``m``."""
+      166 +def moments_sse(m: Moments, w: torch.Tensor, b: torch.Tensor,
+          +sl: slice) -> torch.Tensor:
+      167 +    """Per-output sum of squared errors of x @ w + b for outpu
+          +ts ``sl`` of the data in ``m``."""
+      168      quad = ((m.xx @ w) * w).sum(0) + 2 * b * (m.sx @ w) + m.n
+           * b * b
+      169 -    cross = (m.xy * w).sum(0) + b * m.sy
+      170 -    return m.yy - 2 * cross + quad
+      169 +    cross = (m.xy[:, sl] * w).sum(0) + b * m.sy[sl]
+      170 +    return m.yy[sl] - 2 * cross + quad
+      171
+      172
+      173  # ── metrics ─────────────────────────────────────────────────
+           ────────────────
+
+● Bash(sed -i 's/sse = \[float(moments_sse(m_sel, w\[:, sl\], b\[sl\]).sum())
+      for w, b in sols\]/sse = [float(moments_sse(m_sel, w[:, sl], b[sl],
+      sl).sum()) for w, b i…)
+  ⎿  Updated scripts/geometry/phase0_probe.py (+2 -2)
+      461          chosen = {}
+      462          for g in GROUPS:
+      463              sl = offsets[g]
+      464 -            sse = [float(moments_sse(m_sel, w[:, sl], b[sl]).s
+          -um()) for w, b in sols]
+      464 +            sse = [float(moments_sse(m_sel, w[:, sl], b[sl], s
+          +l).sum()) for w, b in sols]
+      465              chosen[g] = int(np.argmin(sse))
+      466          m_fit.to("cpu"), m_sel.to("cpu")
+      467          x_test = torch.stack(test_feats[l]).to(device=device,
+           dtype=torch.float64)  # (N, 120, D)
+     ...
+      485      x_test = torch.from_numpy(np.stack(test_gae_x)).to(device=
+           device, dtype=torch.float64)
+      486      pred = {}
+      487      for g, sl in ref_offsets.items():
+      488 -        sse = [float(moments_sse(gae_mom["select"], w[:, sl],
+          -b[sl]).sum()) for w, b in sols]
+      488 +        sse = [float(moments_sse(gae_mom["select"], w[:, sl],
+          +b[sl], sl).sum()) for w, b in sols]
+      489          w, b = sols[int(np.argmin(sse))]
+      490          pred[g] = (x_test @ w[:, sl] + b[sl]).cpu().numpy()
+      491      results["reference_gae_latent_input"] = evaluate(pred, {g:
+            ys_test[g] for g in ref_offsets}, slot)
+  ⎿  (files that changed while this command ran, by the command or by
+     another process; a convenience view, not a review or audit of the
+     command)
+
+● Before the real run, a quick numerical check that the statistics-based ridge
+  fit and selection error match a direct least-squares computation:
+  Ran 1 shell command (ctrl+o to expand)
+
+● The ridge solution matches ordinary least squares to 1e-7 and the selection
+  error matches the direct computation. Re-running the smoke test end to end:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The probe works end to end, giving base-rate AP and negative R² on random
+  targets as expected, at about 25 minutes per checkpoint. I'm now confirming
+  the foundation model's architecture config matches the fine-tuned run so its
+  weights load strictly. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both configs match and their target files are ready, so I'm launching the four
+  probe runs in two detached tmux sessions, two per GPU. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● While the probes run (~50 min), here are the Part A results across the three
+  tasks:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Part A's gate answer is clear, though the numbers are against raw DA3 depth
+  since YAM has no ground truth. stand_up_bottle's wrist edge-F1 of 0.90 looks
+  low beside 0.99 precision and 0.98 recall because my F1 scored frames with no
+  edges in either map as zero; I'm checking hang_ring next. · summary
+
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+
+● The head view and wrist view both preserve the thin structures, and the clip
+  encoding visibly alters head-view geometry. Next I'll fix the F1 convention so
+  frames with no edges in either map count as missing, then re-run Part A on
+  GPU 2. · summary
+
+● Update(scripts/geometry/gae_tools.py)
+  ⎿  Added 6 lines, removed 1 line
+      275      n_ref = float(re_.sum())
+      276      prec = float((pe & dilate(re_, tol)).sum()) / n_pred if n_
+           pred else float("nan")
+      277      rec = float((re_ & dilate(pe, tol)).sum()) / n_ref if n_re
+           f else float("nan")
+      278 -    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 els
+          -e 0.0
+      278 +    if not n_pred and not n_ref:
+      279 +        f1 = float("nan")  # neither map has an edge: nothing
+          +to score
+      280 +    elif not n_pred or not n_ref:
+      281 +        f1 = 0.0
+      282 +    else:
+      283 +        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0
+          + else 0.0
+      284      return {"precision": prec, "recall": rec, "f1": f1, "ref_e
+           dge_frac": n_ref / ref_edges.numel()}
+      285
+      286
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Checking on the probes:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Both probes are loading their 24.8 GB checkpoints on CPU in parallel (~5 min),
+  then ~25 min of inference each. I'll wait for the first results.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Inference finished in about 4 minutes, and layer 5 reaches edge AP 0.92
+  against a roughly 17% base rate, which may be inflated by the static scene.
+  After these runs, I'll add a position-prior baseline and dynamic-cell-only
+  metrics to the probe and re-run it. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The layer-0 latent alone already scores 0.915 on edge AP, so the headline
+  numbers mostly reflect recognizing the fixed scene rather than boundary
+  sensitivity. I'm updating the probe with the prior baseline, dynamic-cell
+  metrics, and a saved predictions file so later comparisons don't need a
+  re-run. · summary
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 37 lines, removed 7 lines
+      211      return 1.0 - sse / max(sst, 1e-12)
+      212
+      213
+      214 -def evaluate(pred: dict, ys: dict, slot: np.ndarray, base_rate
+          -_only=False) -> dict:
+      215 -    """pred/ys: group -> (N_frames, 120, k). slot: (120,) 0 he
+          -ad / 1 wrist."""
+      214 +def static_prior(t: dict, rows: np.ndarray, tau: float) -> dic
+          +t:
+      215 +    """Per-position predictions from the fit frames alone (no
+          +model): edge frequency,
+      216 +    mean relative log depth and mean GAE latent of every cell,
+          + in token-row layout."""
+      217 +    return {
+      218 +        "edge": tokens_from_cells((t["depth_edge"][rows].astyp
+          +e(np.float32) > tau).mean(0)[None], 4),
+      219 +        "depth": tokens_from_cells(t["logdepth"][rows].astype(
+          +np.float32).mean(0)[None], 4),
+      220 +        "gae": tokens_from_cells(t["gae"][rows].astype(np.floa
+          +t32).mean(0), 2),
+      221 +    }
+      222 +
+      223 +
+      224 +def sse(pred: np.ndarray, y: np.ndarray) -> float:
+      225 +    return float(((pred - y) ** 2).sum())
+      226 +
+      227 +
+      228 +def evaluate(pred: dict, ys: dict, slot: np.ndarray, prior: di
+          +ct, dynamic: np.ndarray) -> dict:
+      229 +    """pred/ys: group -> (N_frames, 120, k). slot: (120,) 0 he
+          +ad / 1 wrist.
+      230 +
+      231 +    ``prior`` (group -> (120, k)) is the per-position fit-set
+          +average. Scores
+      232 +    against it isolate what a token knows beyond "where in the
+          + fixed scene am I":
+      233 +    * ``*_r2_vs_prior``: 1 - SSE(probe) / SSE(prior)
+      234 +    * ``edge_ap_dynamic``: AP over cells whose fit-set edge fr
+          +equency is within
+      235 +      [0.1, 0.9] (``dynamic`` (120, 16)), i.e. cells that are
+          +edges in some frames
+      236 +      and not in others (arm, gripper, objects); static table
+          +/ background edges excluded.
+      237 +    """
+      238      res = {}
+      217 -    for part, sel in (("all", slice(None)), ("head", slot == 0
+          -), ("wrist", slot == 1)):
+      239 +    for part, sel in (("all", np.ones_like(slot, dtype=bool)),
+          + ("head", slot == 0), ("wrist", slot == 1)):
+      240          e_p = pred["edge"][:, sel].reshape(-1)
+      241          e_y = ys["edge"][:, sel].reshape(-1)
+      242          res[f"edge_ap/{part}"] = average_precision(e_p, e_y)
+      243          res[f"edge_base_rate/{part}"] = float(e_y.mean())
+      222 -        res[f"depth_r2/{part}"] = r2(pred["depth"][:, sel].res
+          -hape(-1, 16), ys["depth"][:, sel].reshape(-1, 16))
+      223 -        if "gae" in pred:
+      224 -            k = ys["gae"].shape[-1]
+      225 -            res[f"gae_r2/{part}"] = r2(pred["gae"][:, sel].res
+          -hape(-1, k), ys["gae"][:, sel].reshape(-1, k))
+      244 +        dyn = np.broadcast_to(dynamic[sel], pred["edge"][:, se
+          +l].shape).reshape(-1)
+      245 +        res[f"edge_ap_dynamic/{part}"] = average_precision(e_p
+          +[dyn], e_y[dyn]) if dyn.any() else float("nan")
+      246 +        res[f"edge_dynamic_base_rate/{part}"] = float(e_y[dyn]
+          +.mean()) if dyn.any() else float("nan")
+      247 +        res[f"edge_dynamic_cell_frac/{part}"] = float(dynamic[
+          +sel].mean())
+      248 +        for g, k in (("depth", 16), ("gae", None)):
+      249 +            if g not in pred:
+      250 +                continue
+      251 +            k = k or ys[g].shape[-1]
+      252 +            p, y = pred[g][:, sel].reshape(-1, k), ys[g][:, se
+          +l].reshape(-1, k)
+      253 +            pr = np.broadcast_to(prior[g][sel], pred[g][:, sel
+          +].shape).reshape(-1, k)
+      254 +            res[f"{g}_r2/{part}"] = r2(p, y)
+      255 +            res[f"{g}_r2_vs_prior/{part}"] = 1.0 - sse(p, y) /
+          + max(sse(pr, y), 1e-12)
+      256      n = pred["edge"].shape[0]
+      257      maps_p = np.stack([cells_from_tokens(pred["edge"][i], 4)[0
+           ] for i in range(n)])
+      258      maps_y = np.stack([cells_from_tokens(ys["edge"][i], 4)[0]
+           for i in range(n)])
+
+● Now wiring the prior and dynamic mask into the main flow, adding the prior as
+  a reference row, and saving test predictions:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 8 lines
+      477          offsets[g] = slice(o, o + k_out[g])
+      478          o += k_out[g]
+      479      ys_test = {g: np.stack(test_y[g]) for g in GROUPS}
+      480 +    fit_rows = np.nonzero(frames[:, 0] == split_names.index("f
+          +it"))[0]
+      481 +    if args.limit:
+      482 +        fit_rows = fit_rows[: args.limit]
+      483 +    prior = static_prior(t, fit_rows, args.tau)
+      484 +    dynamic = (prior["edge"] >= 0.1) & (prior["edge"] <= 0.9)
+      485 +    saved = {"frames": np.array(test_meta), "label_edge": ys_t
+          +est["edge"].astype(np.float16),
+      486 +             "label_depth": ys_test["depth"].astype(np.float16
+          +), "dynamic": dynamic,
+      487 +             "prior_edge": prior["edge"], "prior_depth": prior
+          +["depth"]}
+      488      results = {"layers": {}, "settings": {
+      489          "ckpt_dir": str(Path(args.ckpt_dir).resolve()), "ckpt_
+           name": args.ckpt_name, "targets": args.targets,
+      490          "tau": args.tau, "denoise_steps": denoise_steps, "firs
+           t_step": [list(map(float, s)) for s in first_step],
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 10 lines, removed 6 lines
+      499          chosen = {}
+      500          for g in GROUPS:
+      501              sl = offsets[g]
+      502 -            sse = [float(moments_sse(m_sel, w[:, sl], b[sl], s
+          -l).sum()) for w, b in sols]
+      503 -            chosen[g] = int(np.argmin(sse))
+      502 +            sel_err = [float(moments_sse(m_sel, w[:, sl], b[sl
+          +], sl).sum()) for w, b in sols]
+      503 +            chosen[g] = int(np.argmin(sel_err))
+      504          m_fit.to("cpu"), m_sel.to("cpu")
+      505          x_test = torch.stack(test_feats[l]).to(device=device,
+           dtype=torch.float64)  # (N, 120, D)
+      506          pred = {}
+      507          for g in GROUPS:
+      508              w, b = sols[chosen[g]]
+      509              pred[g] = (x_test @ w[:, offsets[g]] + b[offsets[g
+           ]]).cpu().numpy()
+      510 -        res = evaluate(pred, ys_test, slot)
+      510 +        res = evaluate(pred, ys_test, slot, prior, dynamic)
+      511          res["lambda"] = {g: LAMBDAS[i] for g, i in chosen.item
+           s()}
+      512          results["layers"][str(l)] = res
+      513          viz_preds[l] = pred["edge"][: args.viz_frames]
+      514 -        logger.info("layer %d: edge AP %.3f (head %.3f wrist %
+          -.3f) depth R2 %.3f gae R2 %.3f", l,
+      515 -                    res["edge_ap/all"], res["edge_ap/head"], r
+          -es["edge_ap/wrist"], res["depth_r2/all"],
+      516 -                    res["gae_r2/all"])
+      514 +        saved[f"pred_edge_L{l}"] = pred["edge"].astype(np.floa
+          +t16)
+      515 +        saved[f"pred_depth_L{l}"] = pred["depth"].astype(np.fl
+          +oat16)
+      516 +        logger.info(
+      517 +            "layer %d: edge AP %.3f, dynamic-cell AP %.3f | de
+          +pth R2 vs prior %.3f | gae R2 %.3f (vs prior %.3f)",
+      518 +            l, res["edge_ap/all"], res["edge_ap_dynamic/all"],
+          + res["depth_r2_vs_prior/all"],
+      519 +            res["gae_r2/all"], res["gae_r2_vs_prior/all"],
+      520 +        )
+      521          del x_test
+      522
+      523      # Reference: the GAE latent itself as probe input (edge +
+           depth only).
+
+● Update(scripts/geometry/phase0_probe.py)
+  ⎿  Added 9 lines, removed 3 lines
+      527      x_test = torch.from_numpy(np.stack(test_gae_x)).to(device=
+           device, dtype=torch.float64)
+      528      pred = {}
+      529      for g, sl in ref_offsets.items():
+      530 -        sse = [float(moments_sse(gae_mom["select"], w[:, sl],
+          -b[sl], sl).sum()) for w, b in sols]
+      531 -        w, b = sols[int(np.argmin(sse))]
+      530 +        sel_err = [float(moments_sse(gae_mom["select"], w[:, s
+          +l], b[sl], sl).sum()) for w, b in sols]
+      531 +        w, b = sols[int(np.argmin(sel_err))]
+      532          pred[g] = (x_test @ w[:, sl] + b[sl]).cpu().numpy()
+      533 -    results["reference_gae_latent_input"] = evaluate(pred, {g:
+          - ys_test[g] for g in ref_offsets}, slot)
+      533 +    results["reference_gae_latent_input"] = evaluate(pred, ys_
+          +test, slot, prior, dynamic)
+      534      viz_preds["gae_ref"] = pred["edge"][: args.viz_frames]
+      535 +    saved["pred_edge_gae_ref"] = pred["edge"].astype(np.float1
+          +6)
+      536 +    saved["pred_depth_gae_ref"] = pred["depth"].astype(np.floa
+          +t16)
+      537 +    # Reference: the static per-position prior, no model at al
+          +l.
+      538 +    prior_pred = {g: np.broadcast_to(prior[g], ys_test[g].shap
+          +e) for g in GROUPS}
+      539 +    results["reference_static_prior"] = evaluate(prior_pred, y
+          +s_test, slot, prior, dynamic)
+      540 +    np.savez_compressed(out_path.with_suffix(".preds.npz"), **
+          +saved)
+      541
+      542      best_layer = max(layers, key=lambda l: results["layers"][s
+           tr(l)]["edge_ap/all"])
+      543      results["best_edge_layer"] = best_layer
+
+  Listed 1 directory (ctrl+o to expand)
+
+● Part A's corrected re-run is done; I'm stopping the two old foundation probes,
+  smoke-testing the new script, and relaunching all four runs. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The new script runs end to end. One thing looks suspicious: the depth and GAE
+  "vs prior" scores are identical to three decimals at both layers. Checking for
+  cross-wiring before relaunching:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The gap between the two groups is real beyond the third decimal, but both
+  settle on the same expected ratio under pure-noise targets, so it isn't a bug.
+  I'm relaunching all four runs now. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+● While those run (~20 min), the corrected Part A summary:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All three tasks show GAE's compression costs under 1.1% depth error overall,
+  and picking one frame over a 17-frame clip shifts the teacher's own geometry
+  far more than the codec does. I'm waiting on the probes next. · summary
+
+  Searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● The fine-tuned probes are in (foundation runs follow). Pulling the reference
+  rows (static prior and GAE-latent input) for comparison:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The probe shows mid-layer DiT tokens already encode depth edges better than
+  the GAE latent does, with the geometry built in the first ~5 blocks and fading
+  by layer 30; I'm still waiting on the foundation-model runs before checking
+  localization and the qualitative maps. · summary
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Background command "Wait for all four probe results" completed (exit code 0)
+
+● The foundation and fine-tuned models are nearly identical at every layer,
+  since YAM fine-tuning barely shifted the frame-0 geometry from pretraining
+  (the biggest change is depth R² at layer 15 on place_cube_right, 0.67 to
+  0.71). I'm now doing a qualitative check of the predicted edge maps. · summary
+
+  Read 1 file (ctrl+o to expand)
+
+● The held-out frames are all from episode 56's idle start, so that
+  visualization tells us nothing; the numbers above are the real evidence. Next
+  I'll check whether the existing open-loop outputs can support a cheap
+  follow-up on predicted future frames. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both open-loop videos and real-robot rollouts are available, so a follow-up on
+  predicted-frame geometry would be cheap. I'm closing the finished tmux
+  sessions and saving the key findings to memory. · summary
+
+  Ran 2 shell commands, wrote 1 memory (ctrl+o to expand)
+
+● I've finished Phase 0. GAE passes the gate, but the probe of your current
+  models undercuts the plan's main premise.
+
+  Part A: does GAE keep the geometry of YAM views? Yes
+
+  I encoded held-out frames from all three tasks (head and wrist cameras) and
+  compared GAE-decoded depth with raw DA3 depth. There is no ground-truth depth
+  for YAM, so this measures fidelity to DA3, not correctness.
+
+  ┌─────────────────┬───────────┬─────────────────┬─────────────┬──────────┐
+  │                 │  Depth    │ Error within 3  │   Edge F1   │   RGB    │
+  │                 │   error   │   px of edges   │             │ quality  │
+  ├─────────────────┼───────────┼─────────────────┼─────────────┼──────────┤
+  │ All 3 tasks,    │ 0.8–1.1%  │ 2.2–2.8%        │ 0.977–0.990 │ 34–36 dB │
+  │ head and wrist  │           │                 │             │          │
+  └─────────────────┴───────────┴─────────────────┴─────────────┴──────────┘
+
+  - Thin structures survive. The peg-stand arms, the ring and the cable come
+    through intact (e.g.
+    outputs/geometry_phase0/hang_ring/recon/panels/ep051_f0116.png).
+  - Encode one frame at a time. Encoding a frame inside a 17-frame clip changes
+    DA3's own depth by 5–9%, far more than GAE's compression does. Training and
+    deploy must match, and only single frames can be computed live.
+  - Flat targets are invisible to depth. The blue pad has no depth edge, so a
+    depth-only signal can't mark it.
+
+  Part B: how much geometry do the current models already have? A lot
+
+  I fitted a linear readout from the current-frame video tokens to depth-edge
+  maps at 8 px, i.e. 4×4 cells per token. I scored it only on cells whose edge
+  label changes across frames (arm, gripper, objects), and compared it against a
+  no-model baseline that just predicts each cell's average.
+
+  ┌──────────────────────────┬──────────────────────────┬───────────────────┐
+  │   Input to the readout   │ place_cube_right (step   │ hang_ring (step   │
+  │                          │          3072)           │       5120)       │
+  ├──────────────────────────┼──────────────────────────┼───────────────────┤
+  │ Per-cell average only    │ 0.64                     │ 0.59              │
+  │ (no model)               │                          │                   │
+  ├──────────────────────────┼──────────────────────────┼───────────────────┤
+  │ DiT layer 0 (patch       │ 0.75                     │ 0.77              │
+  │ embedding)               │                          │                   │
+  ├──────────────────────────┼──────────────────────────┼───────────────────┤
+  │ GAE latent itself        │ 0.82                     │ 0.84              │
+  ├──────────────────────────┼──────────────────────────┼───────────────────┤
+  │ DiT layers 5–30          │ 0.92                     │ 0.93–0.94         │
+  └──────────────────────────┴──────────────────────────┴───────────────────┘
+
+  Scores are average precision for edges on changing cells.
+
+  - Depth is there too. The share of depth variation explained beyond the
+    per-cell average peaks at layer 15: 0.71 and 0.81, about the same as the GAE
+    latent (0.72–0.73). It fades toward layer 30.
+  - It comes from pretraining. The foundation model matches the fine-tuned
+    checkpoints at every layer; YAM fine-tuning neither added nor removed
+    geometry.
+  - What's left is fine localization. Edges are placed correctly to within one
+    8-px cell (F1 0.97–0.99), but exact-cell F1 is 0.85 and 0.93. The head
+    camera, where the small objects are, is the weaker view.
+
+  Caveats: DiT tokens give the readout far more dimensions (3072) than the GAE
+  latent (256 per token). Only the current, clean frame was probed. hang_ring
+  has just 4 held-out episodes.
+
+  What this means for the plan
+
+  A Phase 2 alignment loss on the current frame would mostly re-teach what the
+  tokens already contain, so I'd drop that arm. Geometry could still help in two
+  places this probe didn't test:
+  - Predicted future frames: whether the model's predicted video keeps object
+    boundaries in the right place.
+  - The action head: whether the action expert actually uses the geometry the
+    video tokens hold.
+
+  Before building the Phase 1 cache, I'd run two cheap checks on existing
+  outputs, about an hour of GPU and no training:
+  1. Predicted geometry: run DA3 on the generated vs recorded futures in the
+     open-loop videos in outputs/eval_out/.../open_loop/ and score depth
+     agreement and edge F1 per step ahead.
+  2. Failure taxonomy: go through the closed_loop rollouts already recorded for
+     the best checkpoints and count how many failures are boundary or geometry
+     misjudgements.
+
+  If both come back clean, geometry isn't the bottleneck and effort is better
+  spent elsewhere, e.g. a higher-resolution canvas for small head-camera
+  objects.
+
+  Should I run those two checks?
+
+  Nothing is committed. The four scripts are new, uncommitted files in
+  scripts/geometry/, and results are in outputs/geometry_phase0/ (300 MB).
+  /data2 has 24 GB free.
+
+❯ run those two checks.
+
+● Starting with what the existing outputs contain: the open-loop video layout
+  and the closed-loop rollout records.
+
+  Searched for 2 patterns, ran 2 shell commands (ctrl+o to expand)
+
+● The open-loop videos show generated, recorded and difference per frame, with
+  frame 0 as the VAE reconstruction. I'm masking the text labels in the top-left
+  of the head panels, then moving on to the closed-loop records. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Each closed-loop episode records a success flag, a halt reason, and an
+  imagined-vs-live video. Tallying outcomes across all rollouts:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The real-robot runs have 32 failures to classify across three checkpoints, and
+  since no failure reasons were logged, I'm going to classify them from the
+  videos. Next I'm checking the format of the imagined-vs-live videos. · summary
+
+  Searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● The closed-loop videos match the open-loop layout, so I can directly test
+  whether imagined geometry is worse in failed episodes. Next I'm checking the
+  panel gap and frame size in the open-loop writer. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both video types decode cleanly at 964 px wide. I'm running DA3 depth at
+  252×336 on every frame pair and comparing against a hold baseline, scoring
+  within the region where the scene changed. · summary
+
+● Update(scripts/geometry/gae_tools.py)
+  ⎿  Added 23 lines
+      172
+      173
+      174  @torch.inference_mode()
+      175 +def da3_depth(model, images: torch.Tensor) -> torch.Tensor:
+      176 +    """Teacher depth of independent single frames: images (N,
+          +3, H, W) in [0, 1] -> (N, H, W).
+      177 +
+      178 +    DA3 encoder + DPT head only (no GAE codec); each frame is
+          +its own one-view set.
+      179 +    """
+      180 +    h, w = images.shape[-2:]
+      181 +    mean = model.backbone.encoder_mean.to(images).view(1, 3, 1
+          +, 1)
+      182 +    std = model.backbone.encoder_std.to(images).view(1, 3, 1,
+          +1)
+      183 +    x = ((images - mean) / std).unsqueeze(1)
+      184 +    with torch.autocast("cuda", dtype=torch.bfloat16):
+      185 +        feats_cls = model.backbone.encode(x, mode="all")
+      186 +    return raw_depth(model, feats_cls, h, w)
+      187 +
+      188 +
+      189 +def canvas_slots(canvas: np.ndarray) -> Dict[str, np.ndarray]:
+      190 +    """Split a 384x320 canvas (H, W, 3) into its three camera
+          +images."""
+      191 +    out = {}
+      192 +    for camera, (top, left, h, w) in SLOTS.items():
+      193 +        out[CAMERA_SHORT[camera]] = canvas[top : top + h, left
+          + : left + w]
+      194 +    return out
+      195 +
+      196 +
+      197 +@torch.inference_mode()
+      198  def gae_depth(model, mu: torch.Tensor, h: int, w: int) -> torc
+           h.Tensor:
+      199      """Depth read by the same frozen DPT head from GAE-decoded
+            features: (BV, H, W)."""
+      200      with torch.autocast("cuda", dtype=torch.bfloat16):
+
+● Write(scripts/geometry/phase0c_imagined_geometry.py)
+  ⎿  Wrote 199 lines to scripts/geometry/phase0c_imagined_geometry.py
+       1 #!/usr/bin/env python3
+       2 """Phase 0C: is the geometry of OpenWAM's *imagined* future fram
+         es right?
+       3
+       4 Reads the comparison videos the evaluation scripts already wrote
+          — each frame is
+       5 ``imagined | real | |difference|`` (three 320x384 canvases, 2-px
+          gaps), 9 frames
+       6 per chunk, frame 0 being the VAE reconstruction of the observati
+         on:
+     … +193 lines (ctrl+o to expand)
+
+● Smoke-testing on one closed-loop and one open-loop video:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The smoke test shows imagined frames matching reality worse than holding the
+  current frame past the first step, so I'm adding a same-VAE hold baseline and
+  scale-normalizing depth before detecting motion, and moving the metric to GPU.
+  · summary
+
+● Update(scripts/geometry/phase0c_imagined_geometry.py)
+  ⎿  Added 5 lines, removed 1 line
+      17                                  |grad log depth| > tau edges ma
+          tched within tol px)
+      18  * hold_abs_rel, hold_edge_f1  : the chunk's real frame 0 vs rea
+          l frame j — a
+      19                                  model that predicted no motion
+      20 +* hold_vae_*                  : the same no-motion model, but u
+         +sing the imagined
+      21 +                                frame 0 (the Wan VAE reconstruc
+         +tion of the observation),
+      22 +                                so it carries the same VAE blur
+         + as the imagined frames
+      23  * *_dyn                       : the same, only where the real s
+          cene moved since frame 0
+      21 -                                (|Δ log depth| > 0.05, dilated
+         -4 px), i.e. arm / object
+      24 +                                (|Δ log depth| > 0.05 after rem
+         +oving each map's median
+      25 +                                log depth, dilated 4 px), i.e.
+         +arm / object
+      26  * dyn_frac                    : that region's share of the imag
+          e
+      27  * psnr                        : imagined vs real appearance (co
+          ntrol)
+      28
+
+● Update(scripts/geometry/phase0c_imagined_geometry.py)
+  ⎿  Added 2 lines, removed 1 line
+      137      cams = [G.CAMERA_SHORT[c] for c in G.CAMERAS]
+      138
+      139      fields = ["video", "mode", "episode", "success", "chunk",
+           "j", "camera", "abs_rel", "edge_f1", "hold_abs_rel",
+      140 -              "hold_edge_f1", "abs_rel_dyn", "edge_f1_dyn", "h
+          -old_abs_rel_dyn", "hold_edge_f1_dyn", "dyn_frac", "psnr"]
+      140 +              "hold_edge_f1", "hold_vae_abs_rel", "hold_vae_ed
+          +ge_f1", "abs_rel_dyn", "edge_f1_dyn",
+      141 +              "hold_abs_rel_dyn", "hold_edge_f1_dyn", "hold_va
+          +e_abs_rel_dyn", "hold_vae_edge_f1_dyn", "dyn_frac", "psnr"]
+      142      t0 = time.time()
+      143      n_rows = 0
+      144      with open(out, "w", newline="") as f:
+● Update(scripts/geometry/phase0c_imagined_geometry.py)
+  ⎿  Added 25 lines, removed 16 lines
+      159              depth = []
+      160              for b in range(0, len(images), args.batch):
+      161                  x = to_input(images[b : b + args.batch], hw).t
+           o(device)
+      162 -                depth.append(G.da3_depth(model, x).cpu())
+      162 +                depth.append(G.da3_depth(model, x))
+      163              depth = torch.cat(depth)
+      164              lookup = {key: depth[k] for k, key in enumerate(in
+           dex)}
+      165 +            edges = {key: G.log_depth_gradient(depth[k][None])
+          +[0] > args.tau for k, key in enumerate(index)}
+      166              slot_img = {key: images[k] for k, key in enumerate
+           (index)}
+      167
+      167 -            valid_head = torch.ones(hw, dtype=torch.bool)
+      168 +            def rel_log(d):
+      169 +                ld = torch.log(d.clamp_min(1e-4))
+      170 +                return ld - ld.median()
+      171 +
+      172 +            full = torch.ones(hw, dtype=torch.bool, device=dev
+          +ice)
+      173 +            valid_head = full.clone()
+      174              valid_head[:lab_h, :lab_w] = False
+      175              for i, _, _ in frames:
+      176                  chunk, j = divmod(i, FRAMES_PER_CHUNK)
+      171 -                ref0 = chunk * FRAMES_PER_CHUNK  # real frame
+          -0 of this chunk
+      177 +                ref0 = chunk * FRAMES_PER_CHUNK  # frame 0 of
+          +this chunk
+      178                  for cam in cams:
+      173 -                    valid = valid_head if cam == "head" else t
+          -orch.ones(hw, dtype=torch.bool)
+      174 -                    d_im, d_re = lookup[(i, "imagined", cam)],
+          - lookup[(i, "real", cam)]
+      175 -                    d_0 = lookup.get((ref0, "real", cam))
+      176 -                    e_im = G.log_depth_gradient(d_im[None])[0]
+          - > args.tau
+      177 -                    e_re = G.log_depth_gradient(d_re[None])[0]
+          - > args.tau
+      179 +                    valid = valid_head if cam == "head" else f
+          +ull
+      180 +                    k_im, k_re = (i, "imagined", cam), (i, "re
+          +al", cam)
+      181 +                    d_im, d_re = lookup[k_im], lookup[k_re]
+      182                      row = {"video": str(path), **meta, "chunk"
+           : chunk, "j": j, "camera": cam,
+      183                             "abs_rel": masked_agreement(d_im, d
+           _re, valid),
+      180 -                           "edge_f1": masked_f1(e_im, e_re, va
+          -lid, args.tol),
+      181 -                           "psnr": psnr_u8(slot_img[(i, "imagi
+          -ned", cam)], slot_img[(i, "real", cam)])}
+      182 -                    if d_0 is not None and j > 0:
+      183 -                        e_0 = G.log_depth_gradient(d_0[None])[
+          -0] > args.tau
+      184 -                        moved = (torch.log(d_re.clamp_min(1e-4
+          -)) - torch.log(d_0.clamp_min(1e-4))).abs() > args.dyn_thresh
+      184 +                           "edge_f1": masked_f1(edges[k_im], e
+          +dges[k_re], valid, args.tol),
+      185 +                           "psnr": psnr_u8(slot_img[k_im], slo
+          +t_img[k_re])}
+      186 +                    k_0, k_v0 = (ref0, "real", cam), (ref0, "i
+          +magined", cam)
+      187 +                    if j > 0 and k_0 in lookup:
+      188 +                        d_0, d_v0 = lookup[k_0], lookup[k_v0]
+      189 +                        moved = (rel_log(d_re) - rel_log(d_0))
+          +.abs() > args.dyn_thresh
+      190                          dyn = G.dilate(moved[None], 4)[0] & va
+           lid
+      191                          row.update({
+      192                              "hold_abs_rel": masked_agreement(d
+           _0, d_re, valid),
+      188 -                            "hold_edge_f1": masked_f1(e_0, e_r
+          -e, valid, args.tol),
+      193 +                            "hold_edge_f1": masked_f1(edges[k_
+          +0], edges[k_re], valid, args.tol),
+      194 +                            "hold_vae_abs_rel": masked_agreeme
+          +nt(d_v0, d_re, valid),
+      195 +                            "hold_vae_edge_f1": masked_f1(edge
+          +s[k_v0], edges[k_re], valid, args.tol),
+      196                              "abs_rel_dyn": masked_agreement(d_
+           im, d_re, dyn),
+      190 -                            "edge_f1_dyn": masked_f1(e_im, e_r
+          -e, dyn, args.tol),
+      197 +                            "edge_f1_dyn": masked_f1(edges[k_i
+          +m], edges[k_re], dyn, args.tol),
+      198                              "hold_abs_rel_dyn": masked_agreeme
+           nt(d_0, d_re, dyn),
+      192 -                            "hold_edge_f1_dyn": masked_f1(e_0,
+          - e_re, dyn, args.tol),
+      199 +                            "hold_edge_f1_dyn": masked_f1(edge
+          +s[k_0], edges[k_re], dyn, args.tol),
+      200 +                            "hold_vae_abs_rel_dyn": masked_agr
+          +eement(d_v0, d_re, dyn),
+      201 +                            "hold_vae_edge_f1_dyn": masked_f1(
+          +edges[k_v0], edges[k_re], dyn, args.tol),
+      202                              "dyn_frac": float(dyn.float().mean
+           ()),
+      203                          })
+      204                      writer.writerow(row)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The corrected comparison holds on the two-episode sample: imagined frames only
+  beat the hold baseline at depth edges late in the open-loop chunk. At ~6.6
+  frames/s the full ~16k pairs will take about 20 minutes on two GPUs, so I'm
+  launching that run now. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I'm building a contact sheet per failed rollout from the closed-loop videos,
+  plus two successful references per task, and then checking the imagined
+  end-of-chunk frames. · summary
+
+● Write(scripts/geometry/phase0c_failure_sheets.py)
+  ⎿  Wrote 106 lines to scripts/geometry/phase0c_failure_sheets.py
+       1 #!/usr/bin/env python3
+       2 """Contact sheets of closed-loop YAM rollouts, for labelling why
+          failures failed.
+       3
+       4 For each ``ep<N>_imagined_vs_live.mp4`` (scripts/run_yam_policy.
+         py) selected,
+       5 one JPEG: the live canvas at every chunk start, then the last li
+         ve canvas and
+       6 the model's imagined last frame of the final chunk. Tiles are la
+         belled with
+     … +100 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Sheets are ready. Starting with a hang_ring success as the reference for what
+  a correct rollout looks like:
+
+  Read 1 file (ctrl+o to expand)
+
+● Success pattern: approach (c0–c2), grasp (c3–c6), lift (c7), carry to the
+  lower-right peg (c8–c11), and the ring slides onto the peg (right-wrist view,
+  c12). Now the failures:
+
+  Read 2 files (ctrl+o to expand)
+
+● Both insertion failures are in view: ep0 hovers at the peg without seating the
+  ring, and ep5 drops it beside the stand base. I'm rendering enlarged detail
+  sheets for each failure to check the ring–peg alignment, and checking which
+  arm stand_up_bottle uses. · summary
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● All three tasks use only the right arm, and I'm now reviewing the remaining
+  hang_ring failures. · summary
+
+  Read 3 files (ctrl+o to expand)
+
+● The hang_ring failures share a pattern: the ring is grasped and carried fine,
+  then drops onto the peg during insertion, landing on the table in ep5, ep9,
+  ep11 and ep16. I'll keep going through the remaining episodes. · summary
+
+  Read 3 files (ctrl+o to expand)
+
+● ep17, ep25 and ep29 all drop the ring during the insertion attempt, and in
+  ep25 the imagined frame degrades into noise after the drop. I'm moving on to
+  the next batch. · summary
+
+  Read 4 files (ctrl+o to expand)
+
+● Grasp failures show up in ep51, ep56 and ep57, where the ring stays on the
+  table at lift; ep56 and ep57 started with the ring further right. I'm now
+  checking the last three hang_ring failures. · summary
+
+  Read 3 files (ctrl+o to expand)
+
+● Of the 15 hang_ring failures, 12 happen at insertion: 9 where the ring drops
+  while being hung, 3 where the hanging never completes. I'm rendering frames
+  around each release moment to see whether the cause is misalignment or early
+  release. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The gripper commands chatter across 0.5 and one success never crosses it, so a
+  fixed threshold is the wrong event detector. Looking at the actual gripper
+  series:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The gripper command settles near 0.55 when it closes on the ring and rises
+  above 0.75 at release, with failures held about as long as successes. Next
+  I'll render the head and enlarged right-wrist views around each release to see
+  where the ring sits relative to the peg. · summary
+
+  Read 3 files, ran 1 shell command (ctrl+o to expand)
+
+● The release timing looks normal, but the ring sits slightly off in the failed
+  episodes, so I'm checking whether the world model's imagined wrist views
+  predicted the fall. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+❯ Can you stop the process for now?
+
+● Stopping now. First a quick look at how far the two background analysis jobs
+  got (their CSVs are flushed after each video, so finished work is kept), then
+  I'll kill them:
+
+  Ran 1 shell command, wrote 1 memory (ctrl+o to expand)
+
+● I've stopped both checks partway. Nothing of this session is running now, and
+  GPUs 4 and 5 are back to only the other user's ~12 GB.
+
+  Check 1, predicted-frame geometry: about 15% done (11 of 72 hang_ring rollout
+  videos, 11 of 54 stand_up_bottle). place_cube_right and the open-loop videos
+  weren't started. The partial results are saved in
+  outputs/geometry_phase0/imagined/. There's no full result yet; the two-episode
+  smoke test showed predicted depth edges, in the region that actually moves,
+  no better than holding the current frame for about the first half of a chunk.
+
+  Check 2, why real-robot runs failed: hang_ring is finished; stand_up_bottle
+  (16 failures) and place_cube_right (1) aren't reviewed yet.
+  - 12 of 15 hang_ring failures happen while hanging the ring on the peg. The
+    ring is grasped and carried fine, and released at the same timing as in
+    successful runs. But it is held slightly low or off the peg tip when the
+    gripper opens, so it falls to the table. This is a centimetre-scale 3D
+    alignment error, the kind of geometry problem the plan was aimed at.
+  - The other 3 are missed grasps. In two of them (ep56, ep57) the ring started
+    further right than in the other rollouts.
+
+  Next would be to look at whether the model's predicted video showed the ring
+  landing on the peg in those failed runs. Those comparison images are already
+  rendered in outputs/geometry_phase0/failures/hang_ring_release/
+  (*_imagined.jpg) but I haven't looked at them.
+
+  To resume, the job commands are in outputs/logs/phase0c.sh, but that script
+  starts each task's file over, so the finished videos would be redone.
+
+❯ <ide_opened_file>The user opened the file /home/takuya/.claude/projects/-data
+  2-takuya-OpenWAM/memory/gae-geometry-phase0.md in the IDE. This may or may
+  not be related to the current task.</ide_opened_file>
+
+❯ How can I get this session history as a file?
+  ⎿  1 skill available
+
+  Ran 1 shell command (ctrl+o to expand)
+● This session is already saved as a file at /home/takuya/.claude/projects/-data
+  2-takuya-OpenWAM/0ab4e50e-7c96-4df5-8801-f95115b56ca8.jsonl. It's 22 MB of raw
+  JSON lines (every message, tool call and output, plus the images I looked
+  at), so it's not very readable as is.
+
+  There are two ways to turn it into a readable file:
+
+  1. Use /export. In the terminal version of Claude Code, /export writes the
+     conversation to a plain-text file. I'm not sure the VS Code extension has
+     it. If it doesn't, reopen this session in a terminal and run it there:
+  cd /data2/takuya/OpenWAM
+  claude --resume 0ab4e50e-7c96-4df5-8801-f95115b56ca8
+  # then type: /export geometry_session.txt
+  2. Copy the raw file if you just want the complete log:
+  cp /home/takuya/.claude/projects/-data2-takuya-OpenWAM/0ab4e50e-7c96-4df5-8801
+  -f95115b56ca8.jsonl ~/geometry_session.jsonl
+
+  I can also convert the raw file into a Markdown file for you: your messages
+  and my replies in full, tool calls as one-line summaries, images dropped. Do
+  you want that, and where should I put it?

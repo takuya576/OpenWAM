@@ -146,36 +146,30 @@ def init_wandb(cfg, output_path: str | None = None):
 
 
 def reduce_step_metrics(accelerator, losses: dict, grad_norm) -> dict:
-    """Reduce loss/grad_norm across ranks (mean); single-process fast path."""
+    """Reduce loss/grad_norm across ranks (mean); single-process fast path.
+
+    ``losses["align"]`` (the GAE alignment loss) is optional; when the feature is on every
+    rank reports it, so the gathered vector has the same length everywhere.
+    """
     loss = losses["total"]
 
     def _f(v):
         return v.item() if isinstance(v, torch.Tensor) else float(v)
 
+    names = ["loss_total", "loss_video", "loss_action", "grad_norm"]
+    values = [loss.detach().float().item(), _f(losses["video"]), _f(losses["action"]), grad_norm.item()]
+    if "align" in losses:
+        names.append("loss_align")
+        values.append(_f(losses["align"]))
+    for key in sorted(k for k in losses if k.startswith("rgf")):  # RGF baseline terms (same keys on every rank)
+        names.append(f"loss_{key}")
+        values.append(_f(losses[key]))
+
     if accelerator is not None and accelerator.num_processes > 1:
-        local = torch.tensor(
-            [
-                loss.detach().float().item(),
-                _f(losses["video"]),
-                _f(losses["action"]),
-                grad_norm.item(),
-            ],
-            device=loss.device,
-            dtype=torch.float32,
-        ).reshape(1, -1)
+        local = torch.tensor(values, device=loss.device, dtype=torch.float32).reshape(1, -1)
         g = accelerator.gather(local).mean(dim=0)
-        return {
-            "loss_total": g[0].item(),
-            "loss_video": g[1].item(),
-            "loss_action": g[2].item(),
-            "grad_norm": g[3].item(),
-        }
-    return {
-        "loss_total": loss.detach().item(),
-        "loss_video": _f(losses["video"]),
-        "loss_action": _f(losses["action"]),
-        "grad_norm": grad_norm.item(),
-    }
+        return {name: g[i].item() for i, name in enumerate(names)}
+    return dict(zip(names, values))
 
 
 def write_debug_loss_row(

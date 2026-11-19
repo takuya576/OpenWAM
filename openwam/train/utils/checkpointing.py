@@ -231,6 +231,47 @@ def save_weights(accelerator, architecture, output_path: str, global_step: int, 
     logger.info(msg)
     tqdm.write(msg)
 
+    # GAE alignment (training.gae_align): the projector is not in the deploy checkpoint;
+    # keep it in a sibling file for later analysis (pruned in lockstep below).
+    if getattr(model, "gae_projector", None) is not None:
+        from openwam.model.gae_align import projector_path, save_projector
+
+        proj_path = projector_path(output_path, global_step)
+        try:
+            n = save_projector(proj_path, state_dict, model, global_step)
+        except Exception as e:  # analysis artifact only: never stop training over it
+            msg = f"[checkpoint] FAILED to save the GAE projector to {proj_path}: {type(e).__name__}: {e}"
+            logger.error(msg)
+        else:
+            msg = f"[checkpoint] Saved GAE projector ({n} tensors, not loaded at deploy): {proj_path}"
+            logger.info(msg)
+        tqdm.write(msg)
+
+    # RGF baseline (training.rgf): same treatment for its projection heads.
+    if getattr(model, "rgf_projector", None) is not None:
+        from openwam.model.rgf_align import rgf_projector_path, save_rgf_projector
+
+        proj_path = rgf_projector_path(output_path, global_step)
+        try:
+            n = save_rgf_projector(proj_path, state_dict, model, global_step)
+        except Exception as e:  # analysis artifact only: never stop training over it
+            msg = f"[checkpoint] FAILED to save the RGF heads to {proj_path}: {type(e).__name__}: {e}"
+            logger.error(msg)
+        else:
+            msg = f"[checkpoint] Saved RGF heads ({n} tensors, not loaded at deploy): {proj_path}"
+            logger.info(msg)
+        tqdm.write(msg)
+
+
+def _remove_orphan_projectors(output_dir: str) -> None:
+    """Delete ``gae_projector_step_N`` / ``rgf_projector_step_N`` files whose ``checkpoint_step_N.safetensors`` is gone."""
+    for prefix in ("gae_projector_step_", "rgf_projector_step_"):
+        for p in _glob.glob(os.path.join(output_dir, f"{prefix}*.safetensors")):
+            n = step_num(p, prefix)
+            if not os.path.isfile(os.path.join(output_dir, f"checkpoint_step_{n}.safetensors")):
+                os.remove(p)
+                logger.info("Removed auxiliary head file of a pruned checkpoint: %s", p)
+
 
 def save_full_state(accelerator, output_path: str, global_step: int, opt_step: int, epoch: int) -> None:
     """Write full Accelerate state to ``accel_state_step_N/`` for resume.
@@ -368,6 +409,7 @@ def manage_checkpoints(output_dir: str, keep_last_k: int):
         if os.path.isfile(old):
             os.remove(old)
             logger.info("Removed old checkpoint: %s", old)
+    _remove_orphan_projectors(output_dir)
 
     state_dirs = [p for p in _glob.glob(os.path.join(output_dir, "accel_state_step_*")) if os.path.isdir(p)]
     state_dirs.sort(key=lambda p: step_num(p, "accel_state_step_"))
@@ -403,3 +445,4 @@ def finalize_keep_weights_only(output_dir: str, keep_last_k: int = 1):
         if os.path.isfile(old):
             os.remove(old)
             logger.info("Removed old checkpoint after training completion: %s", old)
+    _remove_orphan_projectors(output_dir)

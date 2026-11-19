@@ -68,6 +68,33 @@ training:
   lambda_video: 1.0               # Video flow-matching loss weight
   lambda_action: 1.0              # Action flow-matching loss weight
 
+  # --- GAE alignment loss (training-only; docs/gae_alignment.md, openwam/model/gae_align.py) ---
+  # Aligns the future-frame video tokens after DiT block `layer` to cached GAE geometry latents of the
+  # ground-truth future frames through a projector that is dropped at deployment. Needs
+  # dataloader.gae_cache_dir (written by scripts/geometry/gae_cache.py) and the joint self-attention architecture.
+  gae_align:
+    enabled: false
+    layer: 15                     # hidden states after this many of the 30 DiT blocks
+    weight: 0.5                   # total = lambda_video*video + lambda_action*action + weight*align
+    loss: cosine                  # cosine | mse | cosine_mse  (on GAE's standardized latent)
+    hidden_dim: 2048              # projector width
+
+  # --- Relational Geometry Forcing baseline (training-only; docs/rgf_baseline.md, openwam/model/rgf_align.py) ---
+  # Re-implementation of arXiv 2610.29282: cosine relation matrices of the video tokens (intra-frame per view,
+  # cross-view per view pair) and of the action tokens (step-to-step), after `layer` blocks of both experts,
+  # matched with a Huber loss to those of a frozen multi-view 3D teacher. Two-layer SiLU heads, dropped at
+  # deployment. Needs dataloader.rgf_cache_dir (scripts/geometry/rgf_cache.py). Exclusive with gae_align.
+  rgf:
+    enabled: false
+    layer: 15                     # hidden states after this many blocks of each expert (paper: 15)
+    weight: 0.5                   # lambda_RGF (paper: 0.5)
+    w_intra: 1.0                  # term weights (paper: equal)
+    w_cross: 1.0
+    w_temporal: 1.0
+    proj_dim: 2048                # g_vid 3072->2048, g_act 1024->2048 (paper)
+    hidden_dim: 2048              # hidden width of the two-layer heads
+    huber_beta: 1.0               # smooth-L1 beta (paper: 1)
+
   # --- Flow matching timestep range ---
   max_timestep_boundary: 1.0      # Upper bound (fraction of total timesteps)
   min_timestep_boundary: 0.0      # Lower bound (fraction of total timesteps)
