@@ -62,6 +62,12 @@ camera_layout:
 # longer matches the train episodes is rejected; delete it to rebuild.
 normalize_mode: min-max
 
+# ── Geometry targets ─────────────────────────────────────────────────────────
+# GAE target cache for training.gae_align (scripts/geometry/gae_cache.py); null = no geometry targets.
+gae_cache_dir: null
+# Teacher-feature cache for the RGF baseline training.rgf (scripts/geometry/rgf_cache.py); null = none.
+rgf_cache_dir: null
+
 # ── Video augmentation ───────────────────────────────────────────────────────
 # Same ColorJitter as the α bimanual real-robot fine-tunes; train split only.
 color_jitter:

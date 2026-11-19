@@ -26,8 +26,21 @@
 # of them with 32 / NPROC_PER_NODE per GPU (global batch still 256, same step counts),
 # adapter LR LORA_LR (default 5e-4). Run names get a _lora suffix.
 #
-# Checkpoints: outputs/openwam_checkpoints/hang_ring_n50[_delta][_lora]/<launch time>/
-# wandb run:   hang_ring_n50[_delta][_lora]_<launch time>
+# GAE_ALIGN=1 adds the GAE alignment loss (docs/gae_alignment.md): block GAE_LAYER (default 15),
+# loss GAE_LOSS (cosine | mse | cosine_mse, default cosine), weight GAE_WEIGHT (default 0.5),
+# targets from GAE_CACHE (default assets/gae_cache/hang_ring, written by scripts/geometry/gae_cache.py).
+# Run names get a _gae<layer><loss> suffix.
+#
+# RGF=1 adds the Relational Geometry Forcing baseline (docs/rgf_baseline.md): layer RGF_LAYER (default 15),
+# weight RGF_WEIGHT (default 0.5), teacher RGF_TEACHER (da3 | vggt | gae, default da3) whose cache is RGF_CACHE
+# (default assets/rgf_cache/hang_ring_<teacher>, written by scripts/geometry/rgf_cache.py). Run names get an
+# _rgf<layer> suffix, plus the teacher name for teachers other than da3 (e.g. _rgf15vggt). Cannot be combined
+# with GAE_ALIGN=1.
+#
+# RUN_SUFFIX is appended to the run name as given (e.g. RUN_SUFFIX=_ctrl for a control run).
+#
+# Checkpoints: outputs/openwam_checkpoints/hang_ring_n50[_delta][_lora][_gae...]/<launch time>/
+# wandb run:   hang_ring_n50[_delta][_lora][_gae...]_<launch time>
 #
 # Usage:
 #   bash scripts/train_hang_ring.sh
@@ -63,6 +76,49 @@ if [[ "${DELTA:-1}" == "1" ]]; then
     delta_args=('dataloader.delta_action_dims=["0-5","7-12"]')
 fi
 if [[ "${LORA:-0}" == "1" ]]; then run_name+="_lora"; fi
+gae_args=()
+if [[ "${GAE_ALIGN:-0}" == "1" ]]; then
+    GAE_CACHE="${GAE_CACHE:-$PWD/assets/gae_cache/hang_ring}"
+    if [[ ! -f "${GAE_CACHE}/meta.json" ]]; then
+        echo "GAE_ALIGN=1: no GAE cache at ${GAE_CACHE} (run scripts/geometry/gae_cache.py first)" >&2
+        exit 1
+    fi
+    gae_args=(
+        training.gae_align.enabled=true
+        "training.gae_align.layer=${GAE_LAYER:-15}"
+        "training.gae_align.loss=${GAE_LOSS:-cosine}"
+        "training.gae_align.weight=${GAE_WEIGHT:-0.5}"
+        "dataloader.gae_cache_dir=${GAE_CACHE}"
+    )
+    run_name+="_gae${GAE_LAYER:-15}${GAE_LOSS:-cosine}"
+fi
+rgf_args=()
+if [[ "${RGF:-0}" == "1" ]]; then
+    if [[ "${GAE_ALIGN:-0}" == "1" ]]; then
+        echo "RGF=1 and GAE_ALIGN=1 cannot be combined" >&2
+        exit 1
+    fi
+    RGF_TEACHER="${RGF_TEACHER:-da3}"
+    RGF_CACHE="${RGF_CACHE:-$PWD/assets/rgf_cache/hang_ring_${RGF_TEACHER}}"
+    if [[ ! -f "${RGF_CACHE}/meta.json" ]]; then
+        echo "RGF=1: no teacher cache at ${RGF_CACHE} (run scripts/geometry/rgf_cache.py first)" >&2
+        exit 1
+    fi
+    cache_teacher=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['teacher'])" "${RGF_CACHE}/meta.json")
+    if [[ "${cache_teacher}" != "${RGF_TEACHER}" ]]; then
+        echo "RGF=1: RGF_TEACHER=${RGF_TEACHER} but ${RGF_CACHE} holds ${cache_teacher} features" >&2
+        exit 1
+    fi
+    rgf_args=(
+        training.rgf.enabled=true
+        "training.rgf.layer=${RGF_LAYER:-15}"
+        "training.rgf.weight=${RGF_WEIGHT:-0.5}"
+        "dataloader.rgf_cache_dir=${RGF_CACHE}"
+    )
+    run_name+="_rgf${RGF_LAYER:-15}"
+    if [[ "${RGF_TEACHER}" != "da3" ]]; then run_name+="${RGF_TEACHER}"; fi
+fi
+run_name+="${RUN_SUFFIX:-}"
 
 if [[ "${WAIT_FOR_GPUS:-0}" == "1" ]]; then
     echo "[$(date '+%F %T')] waiting until no other compute process is on the GPUs..."
@@ -93,4 +149,6 @@ bash scripts/train.sh \
     training.save_steps=1280 \
     training.keep_last_k_ckpts=4 \
     ${lora_args[@]+"${lora_args[@]}"} \
+    ${gae_args[@]+"${gae_args[@]}"} \
+    ${rgf_args[@]+"${rgf_args[@]}"} \
     "$@"

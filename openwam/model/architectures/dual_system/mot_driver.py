@@ -361,6 +361,14 @@ class DualSystemMoTDriver:
         # handles the resulting rectangular mask.
         attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
 
+        # Optional capture of the hidden states after selected blocks (1-based count of
+        # blocks run), for training-only auxiliary losses (``gae_align``: video tokens;
+        # ``rgf``: video and action tokens). The tensors are the step's outputs, so they stay
+        # connected to the graph under step-level gradient checkpointing.
+        capture_layers = getattr(self, "capture_layers", ())
+        if capture_layers:
+            self.captured = {}
+            self.captured_action = {}
         for layer_id in range(self.num_layers):
             vstate, astate = self.step(
                 layer_id,
@@ -370,6 +378,9 @@ class DualSystemMoTDriver:
                 use_gradient_checkpointing=use_gradient_checkpointing and layer_id < n_ckpt,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
+            if capture_layers and (layer_id + 1) in capture_layers:
+                self.captured[layer_id + 1] = vstate.hidden_states
+                self.captured_action[layer_id + 1] = astate.payload.x_action
         return vstate, astate
 
 

@@ -206,6 +206,12 @@ class LeRobotV3Reader(BaseDataset):
         # Optional data-budget knobs (None = use the full bucket).
         max_hours: Optional[float] = None,
         subsample_seed: int = 42,
+        # Optional GAE target cache (scripts/geometry/gae_cache.py) for the alignment
+        # loss ``training.gae_align``; None = samples carry no geometry targets.
+        gae_cache_dir: Optional[str] = None,
+        # Optional teacher-feature cache (scripts/geometry/rgf_cache.py) for the Relational
+        # Geometry Forcing baseline ``training.rgf``; None = no RGF targets.
+        rgf_cache_dir: Optional[str] = None,
         **_unused: Any,
     ):
         self._dataset_dir = Path(dataset_dir)
@@ -225,6 +231,16 @@ class LeRobotV3Reader(BaseDataset):
         self._camera_layout_param = list(camera_layout) if camera_layout else None
         self._max_hours = max_hours
         self._subsample_seed = int(subsample_seed)
+        self._gae_cache = None
+        if gae_cache_dir:
+            from openwam.model.gae_align import GAECacheReader
+
+            self._gae_cache = GAECacheReader(str(gae_cache_dir))
+        self._rgf_cache = None
+        if rgf_cache_dir:
+            from openwam.model.rgf_align import RGFCacheReader
+
+            self._rgf_cache = RGFCacheReader(str(rgf_cache_dir))
 
         # ── load-time video augmentation ──────────────────────────────────
         # Color jitter is applied in _getitem_impl to the decoded clip (same
@@ -853,7 +869,7 @@ class LeRobotV3Reader(BaseDataset):
             video = self._decode_window_video(row, ep_local, offset, real_local_indices, idx)
         video_mask = torch.from_numpy(self._video_sample_indices < actual_raw_len)
 
-        return {
+        sample = {
             "video": video,
             "vace_video": None,
             "first_frame_image": [video[0]] if video else [],
@@ -864,6 +880,26 @@ class LeRobotV3Reader(BaseDataset):
             "proprio_mask": torch.from_numpy(proprio_mask),
             "prompt": prompt,
         }
+        if self._gae_cache is not None:
+            # GAE latents of the future video frames (frame 0 is given clean, so it is not
+            # supervised). The cache is indexed by the frame's position in its episode.
+            future = self._video_sample_indices[1:]
+            sample["gae_target"] = self._gae_cache.get(int(row["episode_index"]), offset + future)
+            sample["gae_valid"] = video_mask[1:].clone()
+        if self._rgf_cache is not None:
+            # RGF teacher targets. Video: the RGB frame standing for each latent frame (the last
+            # frame of each VAE group: clip positions 0, 4, 8). Action: the observation at each of
+            # the T_action action steps (step t <-> episode row offset + t).
+            from openwam.model.rgf_align import latent_frame_positions
+
+            ep_index = int(row["episode_index"])
+            lat = self._video_sample_indices[latent_frame_positions(len(self._video_sample_indices))]
+            sample["rgf_grid"] = self._rgf_cache.grid(ep_index, offset + lat)
+            sample["rgf_grid_valid"] = torch.from_numpy(lat < actual_raw_len)
+            steps = np.arange(self._num_frames - 1, dtype=np.int64)
+            sample["rgf_pool"] = self._rgf_cache.pool(ep_index, offset + steps)
+            sample["rgf_pool_valid"] = torch.from_numpy(steps < actual_raw_len)
+        return sample
 
     # ----- action / proprio finalization -----------------------------------
 
@@ -1110,6 +1146,8 @@ class LeRobotV3Reader(BaseDataset):
         "unify_action_map",
         "unify_state_map",
         "color_jitter",
+        "gae_cache_dir",
+        "rgf_cache_dir",
     )
 
     @classmethod

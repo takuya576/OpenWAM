@@ -172,6 +172,44 @@ class OpenWAMTrainer:
         from openwam.model.lora import LoRAConfig, apply_lora
 
         self._lora_cfg = LoRAConfig.from_training_cfg(t)
+
+        # --- GAE alignment loss (training.gae_align; docs/gae_alignment.md). The projector
+        # is created here — after the checkpoint load, which does not contain it, and
+        # before LoRA / the optimizer / prepare() — and is trained in full.
+        from openwam.model.gae_align import GAEAlignConfig
+
+        self._gae_align_cfg = GAEAlignConfig.from_training_cfg(t)
+        if self._gae_align_cfg is not None:
+            if not cfg.dataloader.get("gae_cache_dir", None):
+                raise ValueError(
+                    "training.gae_align.enabled=true needs dataloader.gae_cache_dir (scripts/geometry/gae_cache.py)"
+                )
+            self.architecture.enable_gae_align(self._gae_align_cfg)
+            logger.info("GAE alignment: %s", self._gae_align_cfg)
+            if self._lora_cfg is not None and "gae_projector" not in self._lora_cfg.full_train:
+                import dataclasses
+
+                self._lora_cfg = dataclasses.replace(
+                    self._lora_cfg, full_train=tuple(self._lora_cfg.full_train) + ("gae_projector",)
+                )
+
+        # --- Relational Geometry Forcing baseline (training.rgf; docs/rgf_baseline.md): same
+        # placement and LoRA treatment as the GAE projector above.
+        from openwam.model.rgf_align import RGFConfig
+
+        self._rgf_cfg = RGFConfig.from_training_cfg(t)
+        if self._rgf_cfg is not None:
+            if not cfg.dataloader.get("rgf_cache_dir", None):
+                raise ValueError("training.rgf.enabled=true needs dataloader.rgf_cache_dir (scripts/geometry/rgf_cache.py)")
+            self.architecture.enable_rgf(self._rgf_cfg)
+            logger.info("RGF: %s", self._rgf_cfg)
+            if self._lora_cfg is not None and "rgf_projector" not in self._lora_cfg.full_train:
+                import dataclasses
+
+                self._lora_cfg = dataclasses.replace(
+                    self._lora_cfg, full_train=tuple(self._lora_cfg.full_train) + ("rgf_projector",)
+                )
+
         if self._lora_cfg is not None:
             report = apply_lora(self.architecture, self._lora_cfg, frozen=freeze_list)
             logger.info(report.summary())
@@ -617,11 +655,17 @@ class OpenWAMTrainer:
             lambda_action=self.lambda_action,
         )
 
-        return {
+        losses = {
             "total": result["loss"],
             "video": result.get("loss_video", torch.tensor(0.0)),
             "action": result.get("loss_action", torch.tensor(0.0)),
         }
+        if "loss_align" in result:
+            losses["align"] = result["loss_align"]
+        for key in sorted(result):  # auxiliary terms (e.g. the RGF baseline's loss_rgf, loss_rgf_intra, ...)
+            if key.startswith("loss_rgf"):
+                losses[key[len("loss_") :]] = result[key]
+        return losses
 
     # (10) Called each step in train()'s loop — progress bar, wandb log, debug loss-history CSV.
     def log_step(
@@ -641,6 +685,9 @@ class OpenWAMTrainer:
     ) -> None:
         """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
         labels = [("action", "loss_action")]
+        if "loss_align" in metrics:
+            labels.append(("align", "loss_align"))
+        labels += [(key[len("loss_") :], key) for key in sorted(metrics) if key.startswith("loss_rgf")]
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
         grad_norm = metrics["grad_norm"]
